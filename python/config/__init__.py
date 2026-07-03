@@ -1,0 +1,1 @@
+# Hiperparámetros del Vision Transformer
