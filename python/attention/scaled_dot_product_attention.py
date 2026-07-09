@@ -47,10 +47,6 @@ def usar_mask(mask, batch, cabeza, fila, col):
 
 
 def scaled_dot_product_attention(query, key, value, mask=None):
-    """
-    Attention hecha a mano.
-    Formato esperado: [batch][cabezas][tokens][dim].
-    """
     dim = len(query[0][0][0])
     escala = math.sqrt(dim)
     salida_total = []

@@ -2,7 +2,6 @@ from .scaled_dot_product_attention import scaled_dot_product_attention
 
 
 class MultiHeadSelfAttention:
-    """Self-attention multi-cabeza hecha a mano."""
 
     def __init__(self, d_model, n_heads):
         if d_model % n_heads != 0:
