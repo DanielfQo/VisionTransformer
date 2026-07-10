@@ -14,7 +14,7 @@ def cargar_datos(ruta, train, cantidad):
     datos = datasets.MNIST(
         root=ruta,
         train=train,
-        download=False,
+        download=True,
         transform=transforms.ToTensor(),
     )
 
@@ -97,7 +97,7 @@ def entrenar(args):
     print("Datos train:", x_train.shape, y_train.shape)
     print("Datos test :", x_test.shape, y_test.shape)
     print("Entrenamiento MNIST con ViT")
-    print("epoca | loss_train | acc_train | loss_test | acc_test")
+    print("epoca | loss_train | acc_train")
 
     for epoca in range(1, args.epocas + 1):
         perdidas = []
@@ -124,31 +124,27 @@ def entrenar(args):
             correctos += int(acc * len(yb))
             total += len(yb)
 
-        loss_test, acc_test = evaluar(modelo, x_test, y_test, args.batch)
-
         print(
             f"{epoca:5d} | "
             f"{np.mean(perdidas):10.4f} | "
-            f"{correctos / total:9.4f} | "
-            f"{loss_test:9.4f} | "
-            f"{acc_test:8.4f}"
+            f"{correctos / total:9.4f}"
         )
 
-    _, acc_final = evaluar(modelo, x_test, y_test, args.batch)
-    print(f"Resultado final: accuracy={acc_final:.4f}")
+    loss_test, acc_final = evaluar(modelo, x_test, y_test, args.batch)
+    print(f"Resultado final: loss_test={loss_test:.4f} | accuracy={acc_final:.4f}")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default="/Users/kevrodlm/grafica/ia/data")
-    parser.add_argument("--train", type=int, default=400)
-    parser.add_argument("--test", type=int, default=100)
-    parser.add_argument("--epocas", type=int, default=5)
-    parser.add_argument("--batch", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=0.05)
-    parser.add_argument("--d-model", type=int, default=16)
+    parser.add_argument("--data", default="")
+    parser.add_argument("--train", type=int, default=6000)
+    parser.add_argument("--test", type=int, default=1000)
+    parser.add_argument("--epocas", type=int, default=100)
+    parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--d-model", type=int, default=32)
     parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--layers", type=int, default=1)
+    parser.add_argument("--layers", type=int, default=6)
     parser.add_argument("--mlp", type=int, default=32)
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
