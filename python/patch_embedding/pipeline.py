@@ -1,9 +1,3 @@
-"""
-Combina los tres pasos:
-    1. PatchEmbedding
-    2. CLSToken
-    3. PositionEmbedding
-"""
 
 import numpy as np
 

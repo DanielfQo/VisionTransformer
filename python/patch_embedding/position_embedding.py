@@ -1,16 +1,8 @@
-"""
-Forma de los tensores:
-    in : (B, seq_len, d_model)   secuencia con CLS token ya incluido
-    out  : (B, seq_len, d_model)   
-"""
 
 import numpy as np
 
 
 class PositionEmbedding:
-    """
-    seq_len (int): longitud de la secuencia completa = 1 (CLS) + n_patches.
-    """
 
     def __init__(self, seq_len: int, d_model: int) -> None:
 

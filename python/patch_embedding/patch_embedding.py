@@ -1,11 +1,3 @@
-"""
-
-Dado un tensor de imagen (B, C, H, W):
-  1. Divide la imagen en parches cuadrados de tam patch_size
-  2. Aplana cada parche
-  3. Aplica una proyeccion lineal
-
-"""
 
 import numpy as np
 
@@ -31,13 +23,6 @@ class PatchEmbedding:
         self.bias = np.zeros((d_model,))
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """
-        in:
-            x: shape (B, C, H, W).
-
-        out:
-            Array de forma (B, N, d_model).
-        """
         B, C, H, W = x.shape
         P = self.patch_size
 

@@ -1,11 +1,3 @@
-"""
-El token [CLS] es un token de dimension d_model que se concatena como primer
-elemento de la secuencia en cada elemento del batch.
-
-
-in : (B, N, d_model)   secuencia de embeddings de parche
-out  : (B, N+1, d_model)   CLS token como primer elemento
-"""
 
 import numpy as np
 

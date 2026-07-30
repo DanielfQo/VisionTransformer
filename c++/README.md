@@ -129,3 +129,40 @@ Cabeza de clasificación + ensamblado del modelo (Composite). Clases:
   cumplen la interfaz, y cambiándolos por los reales al integrar.
 
 Ver `docs/division_trabajo.md` para el detalle de qué clase va en cada archivo.
+
+## Compilación de multi-head self-attention
+
+Archivos C++: `capa2_componentes/attention.hpp` y
+`capa2_componentes/attention.cpp`.
+
+Archivos CUDA: `../cuda/capa2_componentes/attention.cuh` y
+`../cuda/capa2_componentes/attention.cu`.
+
+La entrada y salida tienen layout contiguo `[batch, tokens, d_model]`. Cada
+cabeza trabaja con `head_dim = d_model / heads`. Esta version sigue el contrato
+de la implementacion Python actual: usa los propios tokens como Q, K y V, sin
+matrices de proyeccion aprendibles.
+
+La mascara opcional tiene layout `[batch, heads, tokens, tokens]` y tipo
+`uint8_t`: cero bloquea una posicion y cualquier otro valor la permite. Una fila
+completamente bloqueada produce ceros.
+
+Compilar y probar la referencia CPU:
+
+```bash
+c++ -std=c++17 -O2 \
+  capa2_componentes/attention.cpp tests/test_attention.cpp \
+  -o test_attention
+./test_attention
+```
+
+Compilar el componente CUDA:
+
+```bash
+nvcc -std=c++17 -O2 -c \
+  c++/capa2_componentes/attention.cpp cuda/capa2_componentes/attention.cu
+```
+
+`multi_head_self_attention_cuda` recibe punteros ya reservados en la GPU. El
+buffer de salida requiere `batch * tokens * d_model` valores `float`; el buffer
+opcional de pesos requiere `batch * heads * tokens * tokens`.
