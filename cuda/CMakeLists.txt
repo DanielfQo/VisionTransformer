@@ -78,12 +78,16 @@ target_link_libraries(test_encoder PRIVATE vit_core)
 add_executable(test_patch_embedding tests/test_patch_embedding.cu)
 target_link_libraries(test_patch_embedding PRIVATE vit_core)
 
+add_executable(test_gradients tests/test_gradients.cu)
+target_link_libraries(test_gradients PRIVATE vit_core)
+
 # Target global para ejecutar todos los tests
 add_custom_target(run_tests
     COMMAND test_attention
     COMMAND test_encoder
     COMMAND test_patch_embedding
-    DEPENDS test_attention test_encoder test_patch_embedding
+    COMMAND test_gradients
+    DEPENDS test_attention test_encoder test_patch_embedding test_gradients
     COMMENT "Ejecutando todos los tests CUDA..."
 )
 

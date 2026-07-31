@@ -227,6 +227,98 @@ __global__ void attention_kernel(
     }
 }
 
+// backward exacto de softmax(Q.K^T/sqrt(dh)).V con Q=K=V=Y.
+// un bloque por (head, batch); A y dA caben en memoria compartida (tokens <= 64).
+__global__ void attention_backward_kernel(
+    const float* input,      // Y [B, S, D]
+    const float* probs,      // A [B, H, S, S]
+    const float* grad_out,   // dO [B, S, D]
+    float* grad_in,          // dY [B, S, D]
+    int tokens,
+    int d_model,
+    int heads) {
+    const int h = blockIdx.x;
+    const int b = blockIdx.y;
+    const int dim = d_model / heads;
+    const int feature = h * dim;
+    const float scale = rsqrtf(static_cast<float>(dim));
+    const int n2 = tokens * tokens;
+
+    extern __shared__ float smem[];
+    float* s_a    = smem;            // A            [tokens, tokens]
+    float* s_da   = smem + n2;       // dA, luego dS [tokens, tokens]
+    float* s_row  = s_da + n2;       // sum_j A*dA por fila [tokens]
+
+    const std::size_t probs_base =
+        (static_cast<std::size_t>(b) * heads + h) * n2;
+
+    // indice del elemento (t, d) de este head en un tensor [B, S, D]
+    auto elem = [&](int t, int d) {
+        return (static_cast<std::size_t>(b) * tokens + t) * d_model + feature + d;
+    };
+
+    // fase 0: cargar A en memoria compartida
+    for (int t = threadIdx.x; t < n2; t += blockDim.x) {
+        s_a[t] = probs[probs_base + t];
+    }
+    __syncthreads();
+
+    // fase 1: dV[j,d] = sum_i A[i,j] * dO[i,d]  (primera contribucion a dY)
+    for (int t = threadIdx.x; t < tokens * dim; t += blockDim.x) {
+        const int j = t / dim;
+        const int d = t % dim;
+        float acc = 0.0f;
+        for (int i = 0; i < tokens; ++i) {
+            acc += s_a[i * tokens + j] * grad_out[elem(i, d)];
+        }
+        grad_in[elem(j, d)] = acc;
+    }
+
+    // fase 2: dA[i,j] = sum_d dO[i,d] * V[j,d]   (V = input)
+    for (int t = threadIdx.x; t < n2; t += blockDim.x) {
+        const int i = t / tokens;
+        const int j = t % tokens;
+        float acc = 0.0f;
+        for (int d = 0; d < dim; ++d) {
+            acc += grad_out[elem(i, d)] * input[elem(j, d)];
+        }
+        s_da[t] = acc;
+    }
+    __syncthreads();
+
+    // fase 3: s_row[i] = sum_j A[i,j] * dA[i,j]
+    for (int i = threadIdx.x; i < tokens; i += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < tokens; ++j) {
+            acc += s_a[i * tokens + j] * s_da[i * tokens + j];
+        }
+        s_row[i] = acc;
+    }
+    __syncthreads();
+
+    // fase 4: softmax backward + escala: dS[i,j] = A[i,j]*(dA[i,j] - s_row[i])/sqrt(dh)
+    for (int t = threadIdx.x; t < n2; t += blockDim.x) {
+        const int i = t / tokens;
+        s_da[t] = s_a[t] * (s_da[t] - s_row[i]) * scale;
+    }
+    __syncthreads();
+
+    // fase 5: dY[t,d] += dQ[t,d] + dK[t,d]
+    //   dQ[t,d] = sum_j dS[t,j] * K[j,d]   (K = input)
+    //   dK[t,d] = sum_j dS[j,t] * Q[j,d]   (Q = input)
+    for (int t = threadIdx.x; t < tokens * dim; t += blockDim.x) {
+        const int i = t / dim;
+        const int d = t % dim;
+        float acc = 0.0f;
+        for (int j = 0; j < tokens; ++j) {
+            const float y = input[elem(j, d)];
+            acc += s_da[i * tokens + j] * y;   // dQ
+            acc += s_da[j * tokens + i] * y;   // dK
+        }
+        grad_in[elem(i, d)] += acc;
+    }
+}
+
 }  // namespace
 
 void multi_head_self_attention_cuda(
@@ -252,6 +344,39 @@ void multi_head_self_attention_cuda(
         shape.d_model,
         shape.heads);
     check_cuda(cudaGetLastError(), "No se pudo lanzar attention_kernel");
+}
+
+void multi_head_self_attention_backward_cuda(
+    const float* d_input,
+    const float* d_probs,
+    const float* d_grad_out,
+    float* d_grad_in,
+    const AttentionShape& shape,
+    cudaStream_t stream) {
+    shape.validate();
+    if (d_input == nullptr || d_probs == nullptr ||
+        d_grad_out == nullptr || d_grad_in == nullptr) {
+        throw std::invalid_argument(
+            "multi_head_self_attention_backward_cuda: punteros nulos");
+    }
+    if (shape.tokens > 64) {
+        throw std::invalid_argument(
+            "attention backward: tokens > 64 excede la memoria compartida");
+    }
+
+    const int n2 = shape.tokens * shape.tokens;
+    std::size_t smem_bytes =
+        static_cast<std::size_t>(2 * n2 + shape.tokens) * sizeof(float);
+    const dim3 grid(shape.heads, shape.batch);
+    attention_backward_kernel<<<grid, kBlockSize, smem_bytes, stream>>>(
+        d_input,
+        d_probs,
+        d_grad_out,
+        d_grad_in,
+        shape.tokens,
+        shape.d_model,
+        shape.heads);
+    check_cuda(cudaGetLastError(), "No se pudo lanzar attention_backward_kernel");
 }
 
 }  // namespace vit

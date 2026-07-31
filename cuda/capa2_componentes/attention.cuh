@@ -34,4 +34,18 @@ void multi_head_self_attention_cuda(
     float* d_attention_weights = nullptr,
     cudaStream_t stream = nullptr);
 
+// backward de la self-attention sin pesos (Q = K = V = input).
+// d_input:    entrada Y usada en el forward            [batch, tokens, d_model]
+// d_probs:    pesos de atencion A guardados del forward [batch, heads, tokens, tokens]
+// d_grad_out: gradiente respecto a la salida            [batch, tokens, d_model]
+// d_grad_in:  gradiente respecto a la entrada (salida)  [batch, tokens, d_model]
+// dY = dQ + dK + dV con softmax backward exacto sobre A.
+void multi_head_self_attention_backward_cuda(
+    const float* d_input,
+    const float* d_probs,
+    const float* d_grad_out,
+    float* d_grad_in,
+    const AttentionShape& shape,
+    cudaStream_t stream = nullptr);
+
 }  // namespace vit

@@ -431,7 +431,9 @@ __global__ void patch_embedding_pipeline_backward_kernel(
     int d_model) {
     int d = blockIdx.x * blockDim.x + threadIdx.x;
     int seq_len = n_patches + 1;
-    if (d < d_model) {
+    // solo la primera fila de bloques acumula pos/cls/bias: el grid tiene
+    // patch_dim filas (blockIdx.y) y sin este guard se acumularia patch_dim veces
+    if (blockIdx.y == 0 && d < d_model) {
         for (int t = 0; t < seq_len; ++t) {
             float sum_pos = 0.0f;
             for (int b = 0; b < batch; ++b) {

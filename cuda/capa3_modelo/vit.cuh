@@ -7,6 +7,7 @@
 #include "../capa2_componentes/softmax.cuh"
 
 #include <cstddef>
+#include <vector>
 
 namespace vit {
 
@@ -101,5 +102,20 @@ void vit_update_weights_sgd(VitWeights& weights,
                             const VitConfig& config,
                             float learning_rate,
                             cudaStream_t stream = nullptr);
+
+// ---- enumeracion de tensores ----
+
+// referencia a un tensor de parametros en GPU
+struct TensorRef {
+    float* data;
+    std::size_t size;
+};
+
+// devuelve todos los tensores de un VitWeights en un orden fijo y estable.
+// como VitGradients es el mismo tipo, dos listas obtenidas de estructuras
+// distintas se corresponden elemento a elemento (mismo tensor, mismo tamano).
+// esto permite escribir un optimizador sin repetir la lista de parametros.
+std::vector<TensorRef> vit_tensor_list(const VitWeights& weights,
+                                       const VitConfig& config);
 
 }  // namespace vit

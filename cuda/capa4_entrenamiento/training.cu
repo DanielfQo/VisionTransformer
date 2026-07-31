@@ -62,6 +62,33 @@ __global__ void sgd_kernel(float* param, const float* grad,
     }
 }
 
+__global__ void adam_kernel(float* param, const float* grad,
+                            float* m, float* v,
+                            float lr, float beta1, float beta2, float eps,
+                            float weight_decay,
+                            float bias_correction1, float bias_correction2,
+                            std::size_t n) {
+    std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+
+    float g = grad[i];
+
+    // momentos exponenciales
+    float m_i = beta1 * m[i] + (1.0f - beta1) * g;
+    float v_i = beta2 * v[i] + (1.0f - beta2) * g * g;
+    m[i] = m_i;
+    v[i] = v_i;
+
+    // correccion de sesgo: m y v arrancan en 0 y estarian subestimados sin esto
+    float m_hat = m_i / bias_correction1;
+    float v_hat = v_i / bias_correction2;
+
+    // weight decay desacoplado (AdamW): no pasa por los momentos
+    param[i] -= lr * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param[i]);
+}
+
 __global__ void cross_entropy_backward_kernel(const float* logits, const int* labels,
                                               float* grad_logits, int batch, int n_classes) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -134,15 +161,95 @@ void sgd_update_cuda(float* d_param, const float* d_grad,
     check_cuda(cudaGetLastError(), "sgd_kernel");
 }
 
+// ---- optimizador Adam ----
+
+void adam_init(AdamState& state, const VitConfig& config) {
+    // m y v tienen la forma de los pesos: reutilizamos el allocador de gradientes
+    vit_init_gradients(state.m, config);
+    vit_init_gradients(state.v, config);
+    vit_zero_gradients(state.m, config, nullptr);
+    vit_zero_gradients(state.v, config, nullptr);
+    state.step = 0;
+    check_cuda(cudaDeviceSynchronize(), "adam_init zero");
+}
+
+void adam_free(AdamState& state, const VitConfig& config) {
+    vit_free_gradients(state.m, config);
+    vit_free_gradients(state.v, config);
+    state.step = 0;
+}
+
+void adam_update_cuda(float* d_param, const float* d_grad,
+                      float* d_m, float* d_v,
+                      float lr, const AdamConfig& cfg,
+                      float bias_correction1, float bias_correction2,
+                      std::size_t n, cudaStream_t stream) {
+    std::size_t blocks = (n + kBlockSize - 1) / kBlockSize;
+    adam_kernel<<<blocks, kBlockSize, 0, stream>>>(
+        d_param, d_grad, d_m, d_v,
+        lr, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+        bias_correction1, bias_correction2, n);
+    check_cuda(cudaGetLastError(), "adam_kernel");
+}
+
+void vit_update_weights_adam(VitWeights& weights, const VitGradients& grads,
+                             AdamState& state, const VitConfig& config,
+                             float lr, const AdamConfig& cfg,
+                             cudaStream_t stream) {
+    ++state.step;
+
+    // 1 - beta^t, con t = numero de pasos ya aplicados
+    const float t = static_cast<float>(state.step);
+    const float bc1 = 1.0f - std::pow(cfg.beta1, t);
+    const float bc2 = 1.0f - std::pow(cfg.beta2, t);
+
+    // las cuatro listas se corresponden elemento a elemento porque salen
+    // del mismo tipo de estructura y del mismo orden de enumeracion
+    const std::vector<TensorRef> params = vit_tensor_list(weights, config);
+    const std::vector<TensorRef> gradients = vit_tensor_list(grads, config);
+    const std::vector<TensorRef> m_state = vit_tensor_list(state.m, config);
+    const std::vector<TensorRef> v_state = vit_tensor_list(state.v, config);
+
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        adam_update_cuda(params[i].data, gradients[i].data,
+                         m_state[i].data, v_state[i].data,
+                         lr, cfg, bc1, bc2, params[i].size, stream);
+    }
+}
+
+// ---- scheduler de learning rate ----
+
+float lr_schedule(long long step, long long warmup_steps, long long total_steps,
+                  float base_lr, float min_lr) {
+    if (warmup_steps > 0 && step < warmup_steps) {
+        // rampa lineal desde base_lr/warmup_steps hasta base_lr
+        return base_lr * static_cast<float>(step + 1) / static_cast<float>(warmup_steps);
+    }
+
+    long long decay_steps = total_steps - warmup_steps;
+    if (decay_steps <= 0) {
+        return base_lr;
+    }
+
+    float progress = static_cast<float>(step - warmup_steps) / static_cast<float>(decay_steps);
+    progress = std::min(1.0f, std::max(0.0f, progress));
+
+    const float pi = 3.14159265358979323846f;
+    return min_lr + 0.5f * (base_lr - min_lr) * (1.0f + std::cos(pi * progress));
+}
+
 // ---- training loop ----
 
 float train_vit(const float* h_train_images, const int* h_train_labels, int n_train,
                 const float* h_val_images, const int* h_val_labels, int n_val,
                 const float* h_test_images, const int* h_test_labels, int n_test,
                 VitWeights& weights, const VitConfig& config,
-                int epochs, int batch_size, float learning_rate) {
+                const TrainConfig& train_cfg) {
     const int img_size = config.in_channels * config.image_size * config.image_size;
     const int nc = config.n_classes;
+
+    const int epochs = train_cfg.epochs;
+    const int batch_size = train_cfg.batch_size;
 
     // allocate GPU buffers
     float* d_images = nullptr;
@@ -169,6 +276,11 @@ float train_vit(const float* h_train_images, const int* h_train_labels, int n_tr
     VitGradients grads;
     vit_init_gradients(grads, config);
 
+    AdamState adam_state;
+    if (train_cfg.use_adam) {
+        adam_init(adam_state, config);
+    }
+
     // indices para shuffle de entrenamiento
     std::vector<int> indices(n_train);
     std::iota(indices.begin(), indices.end(), 0);
@@ -176,6 +288,13 @@ float train_vit(const float* h_train_images, const int* h_train_labels, int n_tr
 
     int n_batches = n_train / batch_size;
     int n_val_batches = n_val / batch_size;
+
+    // el scheduler avanza por paso (batch), no por epoca
+    const long long total_steps = static_cast<long long>(epochs) * n_batches;
+    const long long warmup_steps =
+        static_cast<long long>(train_cfg.warmup_ratio * static_cast<float>(total_steps));
+    long long global_step = 0;
+    float current_lr = train_cfg.lr;
 
     for (int epoch = 0; epoch < epochs; ++epoch) {
         std::shuffle(indices.begin(), indices.end(), rng);
@@ -223,8 +342,21 @@ float train_vit(const float* h_train_images, const int* h_train_labels, int n_tr
             vit_backward(d_images, d_grad_logits, d_workspace, weights,
                          grads, config, batch_size, nullptr);
 
+            // learning rate de este paso segun el scheduler
+            current_lr = train_cfg.use_adam
+                ? lr_schedule(global_step, warmup_steps, total_steps,
+                              train_cfg.lr, train_cfg.min_lr)
+                : train_cfg.lr;
+
             // actualizar pesos
-            vit_update_weights_sgd(weights, grads, config, learning_rate, nullptr);
+            if (train_cfg.use_adam) {
+                vit_update_weights_adam(weights, grads, adam_state, config,
+                                        current_lr, train_cfg.adam, nullptr);
+            } else {
+                vit_update_weights_sgd(weights, grads, config, current_lr, nullptr);
+            }
+
+            ++global_step;
         }
 
         float avg_train_loss = train_loss_count > 0 ? epoch_train_loss / train_loss_count : 0.0f;
@@ -286,8 +418,8 @@ float train_vit(const float* h_train_images, const int* h_train_labels, int n_tr
         float avg_val_loss = val_loss_count > 0 ? epoch_val_loss / val_loss_count : 0.0f;
         float val_acc = static_cast<float>(val_correct) / static_cast<float>(n_val_batches * batch_size);
 
-        std::printf("Epoch %d/%d -- train_loss: %.4f -- val_loss: %.4f -- val_acc: %.2f%%\n",
-                    epoch + 1, epochs, avg_train_loss, avg_val_loss, val_acc * 100.0f);
+        std::printf("Epoch %d/%d -- lr: %.2e -- train_loss: %.4f -- val_loss: %.4f -- val_acc: %.2f%%\n",
+                    epoch + 1, epochs, current_lr, avg_train_loss, avg_val_loss, val_acc * 100.0f);
         std::fflush(stdout);
     }
 
@@ -342,6 +474,9 @@ float train_vit(const float* h_train_images, const int* h_train_labels, int n_tr
                 accuracy * 100.0f, correct, n_test_batches * batch_size);
 
     // cleanup
+    if (train_cfg.use_adam) {
+        adam_free(adam_state, config);
+    }
     vit_free_gradients(grads, config);
     cudaFree(d_images);
     cudaFree(d_logits);

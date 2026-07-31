@@ -80,14 +80,33 @@ int main() {
     }
 
     // ---- 4. Entrenar y evaluar ----
-    int epochs = 100;
-    int batch_size = 64;
-    float lr = 0.001f;
+    vit::TrainConfig train_cfg;
+    train_cfg.epochs       = 100;
+    train_cfg.batch_size   = 128;
+    train_cfg.lr           = 1e-3f;    // learning rate inicial
+    train_cfg.min_lr       = 1e-4f;    // valor final del coseno
+    train_cfg.warmup_ratio = 0.0f;     // sin warmup: decae desde el primer paso
+    train_cfg.use_adam     = true;     // false = SGD plano, sin scheduler
+
+    train_cfg.adam.beta1        = 0.9f;
+    train_cfg.adam.beta2        = 0.999f;
+    train_cfg.adam.weight_decay = 0.0f;
 
     std::printf("Entrenamiento:\n");
-    std::printf("  Epochs:     %d\n", epochs);
-    std::printf("  Batch size: %d\n", batch_size);
-    std::printf("  LR:         %.4f\n\n", lr);
+    std::printf("  Optimizador: %s\n", train_cfg.use_adam ? "Adam" : "SGD");
+    std::printf("  Epochs:      %d\n", train_cfg.epochs);
+    std::printf("  Batch size:  %d\n", train_cfg.batch_size);
+    std::printf("  LR inicial:  %g\n", train_cfg.lr);
+    if (train_cfg.use_adam) {
+        std::printf("  LR final:    %g\n", train_cfg.min_lr);
+        if (train_cfg.warmup_ratio > 0.0f) {
+            std::printf("  Scheduler:   warmup lineal %.0f%% + coseno\n",
+                        train_cfg.warmup_ratio * 100.0f);
+        } else {
+            std::printf("  Scheduler:   coseno (sin warmup)\n");
+        }
+    }
+    std::printf("\n");
 
     try {
         vit::train_vit(
@@ -95,7 +114,7 @@ int main() {
             val_img_ptr,   val_lbl_ptr,   n_val,
             test_data.images.data(), test_data.labels.data(), test_data.n_samples,
             weights, config,
-            epochs, batch_size, lr);
+            train_cfg);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "Error durante entrenamiento: %s\n", e.what());
         vit::vit_free_weights(weights, config);
