@@ -56,3 +56,5 @@ python/tests/data/
 *.swo
 .DS_Store
 Thumbs.db
+
+/data_mnist
