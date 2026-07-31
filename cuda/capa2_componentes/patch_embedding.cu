@@ -248,3 +248,189 @@ void PatchEmbeddingShape::validate() const {
     }
 }
 
+std::vector<float> patch_embedding_pipeline_cpu(
+    const std::vector<float>& image,
+    const std::vector<float>& weight,
+    const std::vector<float>& bias,
+    const std::vector<float>& cls_token,
+    const std::vector<float>& position_embedding,
+    const PatchEmbeddingShape& shape) {
+    shape.validate();
+    if (image.size() != shape.image_elements()) {
+        throw std::invalid_argument("El tamano de image no coincide con PatchEmbeddingShape");
+    }
+    if (weight.size() != shape.weight_elements()) {
+        throw std::invalid_argument("El tamano de weight debe ser patch_dim * d_model");
+    }
+    if (!bias.empty() && bias.size() != static_cast<std::size_t>(shape.d_model)) {
+        throw std::invalid_argument("bias debe tener forma [d_model]");
+    }
+    if (!cls_token.empty() &&
+        cls_token.size() != static_cast<std::size_t>(shape.d_model)) {
+        throw std::invalid_argument("cls_token debe tener forma [d_model]");
+    }
+    if (position_embedding.size() != shape.position_elements()) {
+        throw std::invalid_argument(
+            "position_embedding debe tener forma [N + 1, d_model]");
+    }
+
+    std::vector<float> output(shape.output_elements(), 0.0F);
+    const int patches_w = shape.patches_w();
+    const int seq_len = shape.seq_len();
+
+    for (int b = 0; b < shape.batch; ++b) {
+        for (int token = 0; token < seq_len; ++token) {
+            for (int d = 0; d < shape.d_model; ++d) {
+                float value = 0.0F;
+                if (token == 0) {
+                    value = cls_token.empty() ? 0.0F : cls_token[d];
+                } else {
+                    const int patch = token - 1;
+                    const int patch_row = patch / patches_w;
+                    const int patch_col = patch % patches_w;
+                    value = bias.empty() ? 0.0F : bias[d];
+
+                    int flat_patch = 0;
+                    for (int c = 0; c < shape.in_channels; ++c) {
+                        for (int i = 0; i < shape.patch_size; ++i) {
+                            for (int j = 0; j < shape.patch_size; ++j) {
+                                const int row = patch_row * shape.patch_size + i;
+                                const int col = patch_col * shape.patch_size + j;
+                                const std::size_t pixel_index =
+                                    ((static_cast<std::size_t>(b) * shape.in_channels + c) *
+                                         shape.height +
+                                     row) *
+                                        shape.width +
+                                    col;
+                                value += image[pixel_index] *
+                                         weight[static_cast<std::size_t>(flat_patch) *
+                                                    shape.d_model +
+                                                d];
+                                ++flat_patch;
+                            }
+                        }
+                    }
+                }
+
+                value += position_embedding[static_cast<std::size_t>(token) *
+                                                shape.d_model +
+                                            d];
+                output[(static_cast<std::size_t>(b) * seq_len + token) *
+                           shape.d_model +
+                       d] = value;
+            }
+        }
+    }
+
+    return output;
+}
+
+void patch_embedding_cuda(
+    const float* d_image,
+    const float* d_weight,
+    const float* d_bias,
+    float* d_patch_tokens,
+    const PatchEmbeddingShape& shape,
+    cudaStream_t stream) {
+    shape.validate();
+    require_device_pointer(d_image, "d_image");
+    require_device_pointer(d_weight, "d_weight");
+    require_device_pointer(d_patch_tokens, "d_patch_tokens");
+
+    const int n_patches = shape.n_patches();
+    const std::size_t elements =
+        static_cast<std::size_t>(n_patches) * shape.d_model;
+    patch_embedding_kernel<<<grid_for(elements, shape.batch), kThreads, 0, stream>>>(
+        d_image,
+        d_weight,
+        d_bias,
+        d_patch_tokens,
+        shape.in_channels,
+        shape.height,
+        shape.width,
+        shape.patch_size,
+        shape.patches_w(),
+        n_patches,
+        shape.d_model);
+    check_cuda(cudaGetLastError(), "No se pudo lanzar patch_embedding_kernel");
+}
+
+void add_cls_token_cuda(
+    const float* d_patch_tokens,
+    const float* d_cls_token,
+    float* d_tokens_with_cls,
+    const PatchEmbeddingShape& shape,
+    cudaStream_t stream) {
+    shape.validate();
+    require_device_pointer(d_patch_tokens, "d_patch_tokens");
+    require_device_pointer(d_tokens_with_cls, "d_tokens_with_cls");
+
+    const int n_patches = shape.n_patches();
+    const std::size_t elements =
+        static_cast<std::size_t>(n_patches + 1) * shape.d_model;
+    add_cls_token_kernel<<<grid_for(elements, shape.batch), kThreads, 0, stream>>>(
+        d_patch_tokens,
+        d_cls_token,
+        d_tokens_with_cls,
+        n_patches,
+        shape.d_model);
+    check_cuda(cudaGetLastError(), "No se pudo lanzar add_cls_token_kernel");
+}
+
+void add_position_embedding_cuda(
+    const float* d_tokens,
+    const float* d_position_embedding,
+    float* d_output,
+    const PatchEmbeddingShape& shape,
+    cudaStream_t stream) {
+    shape.validate();
+    require_device_pointer(d_tokens, "d_tokens");
+    require_device_pointer(d_position_embedding, "d_position_embedding");
+    require_device_pointer(d_output, "d_output");
+
+    const std::size_t elements =
+        static_cast<std::size_t>(shape.seq_len()) * shape.d_model;
+    add_position_embedding_kernel<<<grid_for(elements, shape.batch), kThreads, 0, stream>>>(
+        d_tokens,
+        d_position_embedding,
+        d_output,
+        shape.seq_len(),
+        shape.d_model);
+    check_cuda(cudaGetLastError(), "No se pudo lanzar add_position_embedding_kernel");
+}
+
+void patch_embedding_pipeline_cuda(
+    const float* d_image,
+    const float* d_weight,
+    const float* d_bias,
+    const float* d_cls_token,
+    const float* d_position_embedding,
+    float* d_output,
+    const PatchEmbeddingShape& shape,
+    cudaStream_t stream) {
+    shape.validate();
+    require_device_pointer(d_image, "d_image");
+    require_device_pointer(d_weight, "d_weight");
+    require_device_pointer(d_position_embedding, "d_position_embedding");
+    require_device_pointer(d_output, "d_output");
+
+    const std::size_t elements =
+        static_cast<std::size_t>(shape.seq_len()) * shape.d_model;
+    patch_embedding_pipeline_kernel<<<grid_for(elements, shape.batch), kThreads, 0, stream>>>(
+        d_image,
+        d_weight,
+        d_bias,
+        d_cls_token,
+        d_position_embedding,
+        d_output,
+        shape.in_channels,
+        shape.height,
+        shape.width,
+        shape.patch_size,
+        shape.patches_w(),
+        shape.n_patches(),
+        shape.d_model);
+    check_cuda(cudaGetLastError(), "No se pudo lanzar patch_embedding_pipeline_kernel");
+}
+
+}
