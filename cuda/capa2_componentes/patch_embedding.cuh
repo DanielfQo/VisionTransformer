@@ -68,4 +68,14 @@ void patch_embedding_pipeline_cuda(
     const PatchEmbeddingShape& shape,
     cudaStream_t stream = nullptr);
 
+void patch_embedding_pipeline_backward_cuda(
+    const float* d_image,
+    const float* d_grad_out,
+    float* d_grad_weight,
+    float* d_grad_bias,
+    float* d_grad_cls_token,
+    float* d_grad_position_embedding,
+    const PatchEmbeddingShape& shape,
+    cudaStream_t stream = nullptr);
+
 }  // namespace vit

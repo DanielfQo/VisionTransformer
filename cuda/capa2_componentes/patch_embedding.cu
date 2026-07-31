@@ -412,4 +412,111 @@ void patch_embedding_pipeline_cuda(
     check_cuda(cudaGetLastError(), "No se pudo lanzar patch_embedding_pipeline_kernel");
 }
 
+namespace {
+
+__global__ void patch_embedding_pipeline_backward_kernel(
+    const float* d_image,
+    const float* d_grad_out,
+    float* d_grad_weight,
+    float* d_grad_bias,
+    float* d_grad_cls_token,
+    float* d_grad_pos_embed,
+    int batch,
+    int channels,
+    int height,
+    int width,
+    int patch_size,
+    int patches_w,
+    int n_patches,
+    int d_model) {
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    int seq_len = n_patches + 1;
+    if (d < d_model) {
+        for (int t = 0; t < seq_len; ++t) {
+            float sum_pos = 0.0f;
+            for (int b = 0; b < batch; ++b) {
+                sum_pos += d_grad_out[(static_cast<std::size_t>(b) * seq_len + t) * d_model + d];
+            }
+            if (d_grad_pos_embed != nullptr) {
+                atomicAdd(&d_grad_pos_embed[t * d_model + d], sum_pos);
+            }
+            if (t == 0 && d_grad_cls_token != nullptr) {
+                atomicAdd(&d_grad_cls_token[d], sum_pos);
+            }
+        }
+
+        if (d_grad_bias != nullptr) {
+            float sum_b = 0.0f;
+            for (int b = 0; b < batch; ++b) {
+                for (int p = 0; p < n_patches; ++p) {
+                    sum_b += d_grad_out[(static_cast<std::size_t>(b) * seq_len + (p + 1)) * d_model + d];
+                }
+            }
+            atomicAdd(&d_grad_bias[d], sum_b);
+        }
+    }
+
+    if (d_grad_weight != nullptr) {
+        int flat_patch = blockIdx.y;
+        int d_idx = d;
+        int patch_dim = channels * patch_size * patch_size;
+        if (flat_patch < patch_dim && d_idx < d_model) {
+            int c = flat_patch / (patch_size * patch_size);
+            int rem = flat_patch % (patch_size * patch_size);
+            int pi = rem / patch_size;
+            int pj = rem % patch_size;
+
+            float acc_w = 0.0f;
+            for (int b = 0; b < batch; ++b) {
+                for (int p = 0; p < n_patches; ++p) {
+                    int patch_row = p / patches_w;
+                    int patch_col = p % patches_w;
+                    int r = patch_row * patch_size + pi;
+                    int col = patch_col * patch_size + pj;
+                    float pixel = d_image[((static_cast<std::size_t>(b) * channels + c) * height + r) * width + col];
+                    float dy = d_grad_out[(static_cast<std::size_t>(b) * seq_len + (p + 1)) * d_model + d_idx];
+                    acc_w += pixel * dy;
+                }
+            }
+            atomicAdd(&d_grad_weight[static_cast<std::size_t>(flat_patch) * d_model + d_idx], acc_w);
+        }
+    }
+}
+
+}  // namespace
+
+void patch_embedding_pipeline_backward_cuda(
+    const float* d_image,
+    const float* d_grad_out,
+    float* d_grad_weight,
+    float* d_grad_bias,
+    float* d_grad_cls_token,
+    float* d_grad_position_embedding,
+    const PatchEmbeddingShape& shape,
+    cudaStream_t stream) {
+    shape.validate();
+    require_device_pointer(d_image, "d_image");
+    require_device_pointer(d_grad_out, "d_grad_out");
+
+    int patch_dim = shape.patch_dim();
+    dim3 grid((shape.d_model + kBlockSize - 1) / kBlockSize, patch_dim);
+
+    patch_embedding_pipeline_backward_kernel<<<grid, kBlockSize, 0, stream>>>(
+        d_image,
+        d_grad_out,
+        d_grad_weight,
+        d_grad_bias,
+        d_grad_cls_token,
+        d_grad_position_embedding,
+        shape.batch,
+        shape.in_channels,
+        shape.height,
+        shape.width,
+        shape.patch_size,
+        shape.patches_w(),
+        shape.n_patches(),
+        shape.d_model);
+    check_cuda(cudaGetLastError(), "No se pudo lanzar patch_embedding_pipeline_backward_kernel");
+}
+
 }  // namespace vit
