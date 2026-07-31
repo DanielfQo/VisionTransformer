@@ -34,7 +34,6 @@ void LinearShape::validate() const {
 
 // ---- CPU reference implementations ----
 
-// cada fila es independiente -> paralelizable
 void layer_norm_cpu(const float* input, const float* gamma, const float* beta,
                     float* output, const LayerNormShape& shape, float eps) {
     shape.validate();
@@ -64,7 +63,6 @@ void layer_norm_cpu(const float* input, const float* gamma, const float* beta,
 }
 
 
-// cada elemento de salida es independiente -> paralelizable
 void linear_cpu(const float* input, const float* weight, const float* bias,
                 float* output, const LinearShape& shape) {
     shape.validate();
@@ -98,7 +96,7 @@ void gelu_cpu(const float* input, float* output, std::size_t n) {
 
 namespace {
 
-// una fila por bloque; reduccion en memoria compartida para media y varianza
+// una fila por bloque; reduccion optimizada con warp shuffle (__shfl_down_sync)
 __global__ void layer_norm_kernel(const float* input, const float* gamma,
                                   const float* beta, float* output,
                                   int dim, float eps) {
@@ -106,41 +104,32 @@ __global__ void layer_norm_kernel(const float* input, const float* gamma,
     const float* x = input + static_cast<std::size_t>(row) * dim;
     float* y = output + static_cast<std::size_t>(row) * dim;
 
-    extern __shared__ float red[];
-
     // media
-    float local = 0.0f;
+    float local_sum = 0.0f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        local += x[i];
+        local_sum += x[i];
     }
-    red[threadIdx.x] = local;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s /= 2) {
-        if (threadIdx.x < s) {
-            red[threadIdx.x] += red[threadIdx.x + s];
-        }
-        __syncthreads();
+    float total_sum = block_reduce_sum(local_sum);
+    __shared__ float s_mean;
+    if (threadIdx.x == 0) {
+        s_mean = total_sum / static_cast<float>(dim);
     }
-    float mean = red[0] / static_cast<float>(dim);
     __syncthreads();
+    float mean = s_mean;
 
     // varianza
-    float lv = 0.0f;
+    float local_var = 0.0f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         float d = x[i] - mean;
-        lv += d * d;
+        local_var += d * d;
     }
-    red[threadIdx.x] = lv;
+    float total_var = block_reduce_sum(local_var);
+    __shared__ float s_inv;
+    if (threadIdx.x == 0) {
+        s_inv = rsqrtf(total_var / static_cast<float>(dim) + eps);
+    }
     __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s /= 2) {
-        if (threadIdx.x < s) {
-            red[threadIdx.x] += red[threadIdx.x + s];
-        }
-        __syncthreads();
-    }
-    float inv = rsqrtf(red[0] / static_cast<float>(dim) + eps);
+    float inv = s_inv;
 
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         y[i] = (x[i] - mean) * inv * gamma[i] + beta[i];
@@ -191,8 +180,7 @@ void layer_norm_cuda(const float* d_input, const float* d_gamma,
         throw std::invalid_argument("layer_norm_cuda: punteros nulos");
     }
 
-    std::size_t shared_bytes = kBlockSize * sizeof(float);
-    layer_norm_kernel<<<shape.rows, kBlockSize, shared_bytes, stream>>>(
+    layer_norm_kernel<<<shape.rows, kBlockSize, 0, stream>>>(
         d_input, d_gamma, d_beta, d_output, shape.dim, eps);
     check_cuda(cudaGetLastError(), "No se pudo lanzar layer_norm_kernel");
 }

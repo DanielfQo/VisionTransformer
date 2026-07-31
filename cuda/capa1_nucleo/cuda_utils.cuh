@@ -30,4 +30,58 @@ inline dim3 grid_1d(std::size_t elements, int batch = 1) {
     return dim3(blocks, 1, static_cast<unsigned int>(batch));
 }
 
+// ---- Parte 2: Reducciones optimizadas con Warp Shuffle (__shfl_down_sync) ----
+
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__device__ __forceinline__ float block_reduce_max(float val) {
+    __shared__ float shared[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+
+    val = warp_reduce_max(val);
+
+    if (lane == 0) {
+        shared[warp_id] = val;
+    }
+    __syncthreads();
+
+    val = (threadIdx.x < (blockDim.x / 32)) ? shared[lane] : -CUDART_INF_F;
+    if (warp_id == 0) {
+        val = warp_reduce_max(val);
+    }
+    return val;
+}
+
+__device__ __forceinline__ float block_reduce_sum(float val) {
+    __shared__ float shared[32];
+    int lane = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+
+    val = warp_reduce_sum(val);
+
+    if (lane == 0) {
+        shared[warp_id] = val;
+    }
+    __syncthreads();
+
+    val = (threadIdx.x < (blockDim.x / 32)) ? shared[lane] : 0.0f;
+    if (warp_id == 0) {
+        val = warp_reduce_sum(val);
+    }
+    return val;
+}
+
 }  // namespace vit

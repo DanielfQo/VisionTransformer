@@ -5,52 +5,41 @@
 namespace vit {
 namespace {
 
-// un bloque por fila; reduccion en shared memory
-__global__ void softmax_kernel(const float* input, float* output,
-                               int cols) {
+// un bloque por fila; reduccion rapida usando warp shuffle
+__global__ void softmax_kernel(const float* input, float* output, int cols) {
     int row = blockIdx.x;
     const float* x = input + static_cast<std::size_t>(row) * cols;
     float* y = output + static_cast<std::size_t>(row) * cols;
 
-    extern __shared__ float shared[];
-
-    // paso 1: maximo para estabilidad numerica
+    // paso 1: maximo con warp shuffle
     float local_max = -CUDART_INF_F;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         local_max = fmaxf(local_max, x[i]);
     }
-    shared[threadIdx.x] = local_max;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s /= 2) {
-        if (threadIdx.x < s) {
-            shared[threadIdx.x] = fmaxf(shared[threadIdx.x],
-                                        shared[threadIdx.x + s]);
-        }
-        __syncthreads();
+    float max_val = block_reduce_max(local_max);
+    __shared__ float s_max;
+    if (threadIdx.x == 0) {
+        s_max = max_val;
     }
-    float max_val = shared[0];
     __syncthreads();
+    max_val = s_max;
 
-    // paso 2: exp y suma
+    // paso 2: exp y suma con warp shuffle
     float local_sum = 0.0f;
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         float e = expf(x[i] - max_val);
         y[i] = e;
         local_sum += e;
     }
-    shared[threadIdx.x] = local_sum;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s /= 2) {
-        if (threadIdx.x < s) {
-            shared[threadIdx.x] += shared[threadIdx.x + s];
-        }
-        __syncthreads();
+    float total = block_reduce_sum(local_sum);
+    __shared__ float s_total;
+    if (threadIdx.x == 0) {
+        s_total = total;
     }
-    float total = shared[0];
+    __syncthreads();
+    total = s_total;
 
-    // paso 3: normalizar
+    // paso 3: normalizacion
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         y[i] /= total;
     }
@@ -68,9 +57,7 @@ void softmax_cuda(const float* d_input, float* d_output,
         throw std::invalid_argument("softmax_cuda: dimensiones deben ser positivas");
     }
 
-    std::size_t shared_bytes = kBlockSize * sizeof(float);
-    softmax_kernel<<<rows, kBlockSize, shared_bytes, stream>>>(
-        d_input, d_output, cols);
+    softmax_kernel<<<rows, kBlockSize, 0, stream>>>(d_input, d_output, cols);
     check_cuda(cudaGetLastError(), "No se pudo lanzar softmax_kernel");
 }
 

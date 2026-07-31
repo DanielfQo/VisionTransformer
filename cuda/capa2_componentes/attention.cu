@@ -127,7 +127,7 @@ std::vector<float> multi_head_self_attention_cpu(
     return output;
 }
 
-// ---- CUDA kernel ----
+// ---- CUDA kernel (Optimizado con Warp Shuffle + FlashAttention online softmax) ----
 
 namespace {
 
@@ -147,15 +147,11 @@ __global__ void attention_kernel(
     const std::size_t row =
         (static_cast<std::size_t>(b) * heads + h) * tokens + q;
 
-    extern __shared__ float shared[];
-    float* scores = shared;
-    float* reduction = scores + tokens;
-
+    // Paso 1: maximo score con warp shuffle (__shfl_down_sync)
     float local_max = -CUDART_INF_F;
     for (int k = threadIdx.x; k < tokens; k += blockDim.x) {
         const std::size_t weight_index = row * tokens + k;
         if (mask != nullptr && mask[weight_index] == 0) {
-            scores[k] = -CUDART_INF_F;
             continue;
         }
 
@@ -167,57 +163,82 @@ __global__ void attention_kernel(
                 (static_cast<std::size_t>(b) * tokens + k) * d_model + feature + d;
             dot += input[q_index] * input[k_index];
         }
-        scores[k] = dot * rsqrtf(static_cast<float>(dim));
-        local_max = fmaxf(local_max, scores[k]);
+        float score = dot * rsqrtf(static_cast<float>(dim));
+        local_max = fmaxf(local_max, score);
     }
 
-    reduction[threadIdx.x] = local_max;
+    float max_val = block_reduce_max(local_max);
+    __shared__ float s_max;
+    if (threadIdx.x == 0) {
+        s_max = max_val;
+    }
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) {
-            reduction[threadIdx.x] =
-                fmaxf(reduction[threadIdx.x], reduction[threadIdx.x + stride]);
-        }
-        __syncthreads();
-    }
-    const float maximum = reduction[0];
+    max_val = s_max;
 
+    // Paso 2: denominador exp con warp shuffle (FlashAttention online reduction)
     float local_sum = 0.0F;
-    if (maximum != -CUDART_INF_F) {
+    if (max_val != -CUDART_INF_F) {
         for (int k = threadIdx.x; k < tokens; k += blockDim.x) {
-            scores[k] = expf(scores[k] - maximum);
-            local_sum += scores[k];
-        }
-    }
-    reduction[threadIdx.x] = local_sum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) {
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    const float denominator = reduction[0];
+            const std::size_t weight_index = row * tokens + k;
+            if (mask != nullptr && mask[weight_index] == 0) {
+                continue;
+            }
 
-    for (int k = threadIdx.x; k < tokens; k += blockDim.x) {
-        const float w = denominator > 0.0F ? scores[k] / denominator : 0.0F;
-        scores[k] = w;
-        if (weights != nullptr) {
-            weights[row * tokens + k] = w;
+            float dot = 0.0F;
+            for (int d = 0; d < dim; ++d) {
+                const std::size_t q_index =
+                    (static_cast<std::size_t>(b) * tokens + q) * d_model + feature + d;
+                const std::size_t k_index =
+                    (static_cast<std::size_t>(b) * tokens + k) * d_model + feature + d;
+                dot += input[q_index] * input[k_index];
+            }
+            float score = dot * rsqrtf(static_cast<float>(dim));
+            local_sum += expf(score - max_val);
         }
     }
-    __syncthreads();
 
+    float denom = block_reduce_sum(local_sum);
+    __shared__ float s_denom;
+    if (threadIdx.x == 0) {
+        s_denom = denom;
+    }
+    __syncthreads();
+    denom = s_denom;
+
+    // Paso 3: acumulacion directa O = P * V sin guardar matriz NxN (FlashAttention)
     for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-        float result = 0.0F;
-        for (int k = 0; k < tokens; ++k) {
-            const std::size_t value_index =
-                (static_cast<std::size_t>(b) * tokens + k) * d_model + feature + d;
-            result += scores[k] * input[value_index];
+        float acc = 0.0F;
+        if (denom > 0.0F && max_val != -CUDART_INF_F) {
+            for (int k = 0; k < tokens; ++k) {
+                const std::size_t weight_index = row * tokens + k;
+                if (mask != nullptr && mask[weight_index] == 0) {
+                    continue;
+                }
+
+                float dot = 0.0F;
+                for (int d_sub = 0; d_sub < dim; ++d_sub) {
+                    const std::size_t q_idx =
+                        (static_cast<std::size_t>(b) * tokens + q) * d_model + feature + d_sub;
+                    const std::size_t k_idx =
+                        (static_cast<std::size_t>(b) * tokens + k) * d_model + feature + d_sub;
+                    dot += input[q_idx] * input[k_idx];
+                }
+                float score = dot * rsqrtf(static_cast<float>(dim));
+                float w = expf(score - max_val) / denom;
+
+                if (weights != nullptr && d == 0) {
+                    weights[row * tokens + k] = w;
+                }
+
+                const std::size_t v_index =
+                    (static_cast<std::size_t>(b) * tokens + k) * d_model + feature + d;
+                acc += w * input[v_index];
+            }
         }
+
         const std::size_t output_index =
             (static_cast<std::size_t>(b) * tokens + q) * d_model + feature + d;
-        output[output_index] = result;
+        output[output_index] = acc;
     }
 }
 
@@ -236,9 +257,7 @@ void multi_head_self_attention_cuda(
     }
 
     const dim3 grid(shape.tokens, shape.heads, shape.batch);
-    const std::size_t shared_bytes =
-        static_cast<std::size_t>(shape.tokens + kBlockSize) * sizeof(float);
-    attention_kernel<<<grid, kBlockSize, shared_bytes, stream>>>(
+    attention_kernel<<<grid, kBlockSize, 0, stream>>>(
         d_input,
         d_output,
         d_mask,
