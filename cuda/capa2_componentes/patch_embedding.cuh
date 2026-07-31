@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cuda_runtime_api.h>
+#include "../capa1_nucleo/cuda_utils.cuh"
 
 #include <cstddef>
 #include <vector>
@@ -68,4 +68,4 @@ void patch_embedding_pipeline_cuda(
     const PatchEmbeddingShape& shape,
     cudaStream_t stream = nullptr);
 
-}
+}  // namespace vit

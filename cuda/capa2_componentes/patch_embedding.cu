@@ -6,8 +6,6 @@
 namespace vit {
 namespace {
 
-constexpr int kThreads = 256;
-
 __device__ __forceinline__ std::size_t image_index(
     int b,
     int c,
@@ -175,26 +173,7 @@ __global__ void patch_embedding_pipeline_kernel(
     output[token_index(b, token, d, seq_len, d_model)] = value;
 }
 
-void check_cuda(cudaError_t error, const char* operation) {
-    if (error != cudaSuccess) {
-        throw std::runtime_error(
-            std::string(operation) + ": " + cudaGetErrorString(error));
-    }
-}
-
-dim3 grid_for(std::size_t elements, int batch) {
-    const auto blocks =
-        static_cast<unsigned int>((elements + kThreads - 1) / kThreads);
-    return dim3(blocks, 1, static_cast<unsigned int>(batch));
-}
-
-void require_device_pointer(const float* pointer, const char* name) {
-    if (pointer == nullptr) {
-        throw std::invalid_argument(std::string(name) + " no puede ser nullptr");
-    }
-}
-
-}
+}  // namespace
 
 int PatchEmbeddingShape::patches_h() const {
     return height / patch_size;
@@ -340,7 +319,7 @@ void patch_embedding_cuda(
     const int n_patches = shape.n_patches();
     const std::size_t elements =
         static_cast<std::size_t>(n_patches) * shape.d_model;
-    patch_embedding_kernel<<<grid_for(elements, shape.batch), kThreads, 0, stream>>>(
+    patch_embedding_kernel<<<grid_1d(elements, shape.batch), kBlockSize, 0, stream>>>(
         d_image,
         d_weight,
         d_bias,
@@ -368,7 +347,7 @@ void add_cls_token_cuda(
     const int n_patches = shape.n_patches();
     const std::size_t elements =
         static_cast<std::size_t>(n_patches + 1) * shape.d_model;
-    add_cls_token_kernel<<<grid_for(elements, shape.batch), kThreads, 0, stream>>>(
+    add_cls_token_kernel<<<grid_1d(elements, shape.batch), kBlockSize, 0, stream>>>(
         d_patch_tokens,
         d_cls_token,
         d_tokens_with_cls,
@@ -390,7 +369,7 @@ void add_position_embedding_cuda(
 
     const std::size_t elements =
         static_cast<std::size_t>(shape.seq_len()) * shape.d_model;
-    add_position_embedding_kernel<<<grid_for(elements, shape.batch), kThreads, 0, stream>>>(
+    add_position_embedding_kernel<<<grid_1d(elements, shape.batch), kBlockSize, 0, stream>>>(
         d_tokens,
         d_position_embedding,
         d_output,
@@ -416,7 +395,7 @@ void patch_embedding_pipeline_cuda(
 
     const std::size_t elements =
         static_cast<std::size_t>(shape.seq_len()) * shape.d_model;
-    patch_embedding_pipeline_kernel<<<grid_for(elements, shape.batch), kThreads, 0, stream>>>(
+    patch_embedding_pipeline_kernel<<<grid_1d(elements, shape.batch), kBlockSize, 0, stream>>>(
         d_image,
         d_weight,
         d_bias,
@@ -433,4 +412,4 @@ void patch_embedding_pipeline_cuda(
     check_cuda(cudaGetLastError(), "No se pudo lanzar patch_embedding_pipeline_kernel");
 }
 
-}
+}  // namespace vit
