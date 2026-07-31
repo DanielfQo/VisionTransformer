@@ -93,7 +93,7 @@ Para ejecutar las pruebas unitarias CUDA de cada componente:
   - `cuda_utils.cuh`: Funciones de reducción rápida usando **Warp Shuffle** (`__shfl_down_sync`).
 - **`capa2_componentes/`**:
   - `patch_embedding`: Divide la imagen 28x28 en parches de 7x7 y proyecta los tokens con embeddings de posición.
-  - `attention`: Multi-Head Self-Attention optimizado con el patrón **FlashAttention** (online softmax).
+  - `attention`: Multi-Head Self-Attention fusionado por filas con caché de puntajes y reducciones **Warp Shuffle**.
   - `encoder`: LayerNorm y MLP (capas lineales + activación GELU).
   - `softmax`: Softmax CUDA optimizado con reducción en memoria compartida.
 - **`capa3_modelo/`**:

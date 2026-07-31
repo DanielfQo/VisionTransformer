@@ -72,6 +72,9 @@ target_compile_definitions(vit_train PRIVATE
 add_executable(test_attention tests/test_attention.cu)
 target_link_libraries(test_attention PRIVATE vit_core)
 
+add_executable(test_softmax tests/test_softmax.cu)
+target_link_libraries(test_softmax PRIVATE vit_core)
+
 add_executable(test_encoder tests/test_encoder.cu)
 target_link_libraries(test_encoder PRIVATE vit_core)
 
@@ -84,10 +87,11 @@ target_link_libraries(test_gradients PRIVATE vit_core)
 # Target global para ejecutar todos los tests
 add_custom_target(run_tests
     COMMAND test_attention
+    COMMAND test_softmax
     COMMAND test_encoder
     COMMAND test_patch_embedding
     COMMAND test_gradients
-    DEPENDS test_attention test_encoder test_patch_embedding test_gradients
+    DEPENDS test_attention test_softmax test_encoder test_patch_embedding test_gradients
     COMMENT "Ejecutando todos los tests CUDA..."
 )
 

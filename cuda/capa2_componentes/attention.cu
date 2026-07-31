@@ -127,8 +127,6 @@ std::vector<float> multi_head_self_attention_cpu(
     return output;
 }
 
-// ---- CUDA kernel (Optimizado con Warp Shuffle + FlashAttention online softmax) ----
-
 namespace {
 
 __global__ void attention_kernel(
