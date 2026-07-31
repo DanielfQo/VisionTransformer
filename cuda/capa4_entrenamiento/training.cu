@@ -137,6 +137,7 @@ void sgd_update_cuda(float* d_param, const float* d_grad,
 // ---- training loop ----
 
 float train_vit(const float* h_train_images, const int* h_train_labels, int n_train,
+                const float* h_val_images, const int* h_val_labels, int n_val,
                 const float* h_test_images, const int* h_test_labels, int n_test,
                 VitWeights& weights, const VitConfig& config,
                 int epochs, int batch_size, float learning_rate) {
@@ -168,18 +169,19 @@ float train_vit(const float* h_train_images, const int* h_train_labels, int n_tr
     VitGradients grads;
     vit_init_gradients(grads, config);
 
-    // indices para shuffle
+    // indices para shuffle de entrenamiento
     std::vector<int> indices(n_train);
     std::iota(indices.begin(), indices.end(), 0);
     std::mt19937 rng(123);
 
     int n_batches = n_train / batch_size;
+    int n_val_batches = n_val / batch_size;
 
     for (int epoch = 0; epoch < epochs; ++epoch) {
         std::shuffle(indices.begin(), indices.end(), rng);
 
-        float epoch_loss = 0.0f;
-        int loss_count = 0;
+        float epoch_train_loss = 0.0f;
+        int train_loss_count = 0;
 
         for (int b = 0; b < n_batches; ++b) {
             // preparar batch en host
@@ -212,8 +214,8 @@ float train_vit(const float* h_train_images, const int* h_train_labels, int n_tr
             // loss
             float loss = cross_entropy_loss(d_logits, d_labels, batch_size,
                                              nc, d_loss_ws, nullptr);
-            epoch_loss += loss;
-            ++loss_count;
+            epoch_train_loss += loss;
+            ++train_loss_count;
 
             // backward pass
             cross_entropy_backward_cuda(d_logits, d_labels, d_grad_logits,
@@ -225,11 +227,71 @@ float train_vit(const float* h_train_images, const int* h_train_labels, int n_tr
             vit_update_weights_sgd(weights, grads, config, learning_rate, nullptr);
         }
 
-        float avg_loss = loss_count > 0 ? epoch_loss / loss_count : 0.0f;
-        std::printf("Epoch %d/%d -- loss: %.4f\n", epoch + 1, epochs, avg_loss);
+        float avg_train_loss = train_loss_count > 0 ? epoch_train_loss / train_loss_count : 0.0f;
+
+        // ---- evaluacion de validacion por epoca ----
+        float epoch_val_loss = 0.0f;
+        int val_loss_count = 0;
+        int val_correct = 0;
+
+        for (int b = 0; b < n_val_batches; ++b) {
+            std::vector<float> h_batch_img(static_cast<std::size_t>(batch_size) * img_size);
+            std::vector<int>   h_batch_lbl(batch_size);
+
+            for (int i = 0; i < batch_size; ++i) {
+                int idx = b * batch_size + i;
+                std::copy(h_val_images + static_cast<std::size_t>(idx) * img_size,
+                          h_val_images + static_cast<std::size_t>(idx + 1) * img_size,
+                          h_batch_img.data() + static_cast<std::size_t>(i) * img_size);
+                h_batch_lbl[i] = h_val_labels[idx];
+            }
+
+            check_cuda(cudaMemcpyAsync(d_images, h_batch_img.data(),
+                                       h_batch_img.size() * sizeof(float),
+                                       cudaMemcpyHostToDevice, nullptr), "copy val images");
+            check_cuda(cudaMemcpyAsync(d_labels, h_batch_lbl.data(),
+                                       h_batch_lbl.size() * sizeof(int),
+                                       cudaMemcpyHostToDevice, nullptr), "copy val labels");
+
+            vit_forward(d_images, d_logits, d_workspace, weights, config,
+                        batch_size, nullptr);
+
+            float v_loss = cross_entropy_loss(d_logits, d_labels, batch_size,
+                                              nc, d_loss_ws, nullptr);
+            epoch_val_loss += v_loss;
+            ++val_loss_count;
+
+            // calcular accuracy de validacion
+            std::vector<float> h_logits(static_cast<std::size_t>(batch_size) * nc);
+            check_cuda(cudaMemcpy(h_logits.data(), d_logits,
+                                  h_logits.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost), "copy val logits D->H");
+
+            for (int i = 0; i < batch_size; ++i) {
+                int pred = 0;
+                float max_val = h_logits[static_cast<std::size_t>(i) * nc];
+                for (int c = 1; c < nc; ++c) {
+                    float val = h_logits[static_cast<std::size_t>(i) * nc + c];
+                    if (val > max_val) {
+                        max_val = val;
+                        pred = c;
+                    }
+                }
+                if (pred == h_batch_lbl[i]) {
+                    ++val_correct;
+                }
+            }
+        }
+
+        float avg_val_loss = val_loss_count > 0 ? epoch_val_loss / val_loss_count : 0.0f;
+        float val_acc = static_cast<float>(val_correct) / static_cast<float>(n_val_batches * batch_size);
+
+        std::printf("Epoch %d/%d -- train_loss: %.4f -- val_loss: %.4f -- val_acc: %.2f%%\n",
+                    epoch + 1, epochs, avg_train_loss, avg_val_loss, val_acc * 100.0f);
+        std::fflush(stdout);
     }
 
-    // ---- evaluacion en test ----
+    // ---- evaluacion final en test ----
     int correct = 0;
     int n_test_batches = n_test / batch_size;
 

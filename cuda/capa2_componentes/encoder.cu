@@ -184,6 +184,18 @@ __global__ void linear_kernel(const float* input, const float* weight,
     }
 }
 
+__global__ void gelu_kernel(const float* input, float* output, std::size_t n) {
+    std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+
+    float x = input[i];
+    float k = 0.7978845608028654f;  // sqrt(2/pi)
+    float c = 0.044715f;
+    output[i] = 0.5f * x * (1.0f + tanhf(k * (x + c * x * x * x)));
+}
+
 }  // namespace
 
 

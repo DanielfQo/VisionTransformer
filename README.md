@@ -1,326 +1,105 @@
-# Transformer
+# Vision Transformer en CUDA (MNIST)
 
-Implementacion educativa de componentes base para un Vision Transformer (ViT).
+Implementación autocontenida y optimizada de un **Vision Transformer (ViT)** en CUDA para clasificación de imágenes (**MNIST**).
 
-Este README documenta solo lo implementado en esta parte: MLP, bloque encoder, metricas, trainer, inicializacion de pesos y pruebas.
+---
 
-## MLP
+## ⚡ Requisitos
 
-Archivo: `python/layers/mlp.py`
+- GPU NVIDIA
+- CUDA Toolkit (11.x, 12.x o 13.x)
+- CMake 3.20+
+- MSVC (Windows) o GCC/G++ (Linux)
 
-Clase: `MLP`
+---
 
-Implementa el feed-forward network usado dentro de un bloque Transformer. Tiene dos capas lineales, activacion GELU y dropout opcional.
+## 🚀 Cómo Compilar y Ejecutar
 
-### Parametros del constructor
+### **1. Compilar el Proyecto (Windows PowerShell)**
 
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `d_model` | `int` | Dimension de cada token de entrada y salida. |
-| `hidden_dim` | `int` o `None` | Dimension interna del MLP. Si es `None`, usa `d_model * 4`. |
-| `dropout` | `float` | Probabilidad de apagar valores durante entrenamiento. Por defecto `0.0`. |
-| `seed` | `int` o `None` | Semilla para inicializar pesos y dropout de forma reproducible. |
+```powershell
+# Entrar a la carpeta cuda
+cd cuda
 
-### Entrada de `forward`
+# Configurar el proyecto con CMake
+cmd.exe /c "call ""C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat"" && cmake -G ""Ninja"" -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86"
 
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `x` | `np.ndarray` o `list` | Tensor con forma `(batch, seq_len, d_model)`. |
-| `training` | `bool` | Si es `True`, aplica dropout. Por defecto `False`. |
-
-### Devuelve
-
-Un tensor con la misma forma que la entrada: `(batch, seq_len, d_model)`.
-
-Si la entrada fue una lista de Python, devuelve una lista. Si la entrada fue `np.ndarray`, devuelve `np.ndarray`.
-
-## TransformerEncoderBlock
-
-Archivo: `python/model/encoder_block.py`
-
-Clase: `TransformerEncoderBlock`
-
-Implementa un bloque encoder del Transformer con pre-normalizacion, multi-head self-attention, MLP y conexiones residuales.
-
-Flujo interno:
-
-```text
-x -> LayerNorm -> MultiHeadSelfAttention -> residual -> LayerNorm -> MLP -> residual
+# Compilar en modo Release
+cmd.exe /c "call ""C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat"" && cmake --build build --config Release"
 ```
 
-### Parametros del constructor
+### **2. Ejecutar el ViT en MNIST**
 
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `d_model` | `int` | Dimension de los tokens. |
-| `n_heads` | `int` | Numero de cabezas de atencion. `d_model` debe ser divisible entre `n_heads`. |
-| `mlp_hidden_dim` | `int` o `None` | Dimension oculta del MLP. Si es `None`, el MLP usa `d_model * 4`. |
-| `dropout` | `float` | Dropout usado dentro del MLP. Por defecto `0.0`. |
-| `seed` | `int` o `None` | Semilla para inicializar el MLP. |
-
-### Entrada de `forward`
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `x` | `np.ndarray` o `list` | Secuencia de tokens con forma `(batch, seq_len, d_model)`. |
-| `mask` | `list` o `None` | Mascara opcional para la atencion. Por defecto `None`. |
-| `training` | `bool` | Si es `True`, activa dropout en el MLP. Por defecto `False`. |
-| `devolver_pesos` | `bool` | Si es `True`, tambien devuelve los pesos de atencion. |
-
-### Devuelve
-
-Si `devolver_pesos=False`:
-
-```text
-salida
+```powershell
+.\build\vit_train.exe
 ```
 
-Donde `salida` tiene forma `(batch, seq_len, d_model)`.
+### **4. Recompilar y Ejecutar tras hacer cambios**
 
-Si `devolver_pesos=True`:
-
-```text
-salida, pesos
+```powershell
+cmd.exe /c "call ""C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat"" && cmake --build build --config Release" ; .\build\vit_train.exe
 ```
 
-Donde:
+### **5. Limpiar el Build (Clean Build)**
 
-- `salida`: tensor con forma `(batch, seq_len, d_model)`.
-- `pesos`: pesos de atencion con estructura `(batch, n_heads, seq_len, seq_len)`.
+Si deseas eliminar los binarios y archivos temporales para compilar completamente desde cero:
 
-Al igual que `MLP`, conserva el tipo principal de la entrada: lista si recibe lista, `np.ndarray` si recibe arreglo NumPy.
+#### **En Windows (PowerShell):**
+```powershell
+# Opcion A: Usando CMake clean target
+cmake --build build --target clean
 
-## Metricas
-
-Archivo: `python/training/metrics.py`
-
-Funciones implementadas para evaluar clasificacion.
-
-### `accuracy_score(y_true, y_pred)`
-
-Parametros:
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `y_true` | array-like | Etiquetas reales. |
-| `y_pred` | array-like | Predicciones. Puede ser vector de clases o matriz de logits/probabilidades. |
-
-Devuelve:
-
-```text
-float
+# Opcion B: Borrar la carpeta build por completo
+Remove-Item -Recurse -Force build
 ```
 
-Representa la proporcion de predicciones correctas. Si `y_pred` tiene mas de una dimension, se usa `argmax`.
+#### **En Linux / WSL:**
+```bash
+# Opcion A: Usando CMake clean target
+cmake --build build --target clean
 
-### `confusion_matrix(y_true, y_pred, n_classes=None)`
-
-Parametros:
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `y_true` | array-like | Etiquetas reales. |
-| `y_pred` | array-like | Predicciones como clases o logits/probabilidades. |
-| `n_classes` | `int` o `None` | Numero de clases. Si es `None`, se infiere desde las etiquetas. |
-
-Devuelve:
-
-```text
-np.ndarray
+# Opcion B: Borrar la carpeta build por completo
+rm -rf build
 ```
 
-Matriz de confusion con forma `(n_classes, n_classes)`.
-
-### `precision_recall_f1(y_true, y_pred, n_classes=None)`
-
-Parametros:
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `y_true` | array-like | Etiquetas reales. |
-| `y_pred` | array-like | Predicciones como clases o logits/probabilidades. |
-| `n_classes` | `int` o `None` | Numero de clases. Si es `None`, se infiere desde las etiquetas. |
-
-Devuelve:
-
-```python
-{
-    "precision": [...],
-    "recall": [...],
-    "f1": [...],
-    "macro_f1": float,
-}
-```
-
-## Trainer
-
-Archivo: `python/training/trainer.py`
-
-Clase: `Trainer`
-
-Implementa un loop generico para entrenamiento y validacion. Esta pensado para modelos simples del proyecto y tambien puede trabajar con optimizadores estilo PyTorch si existen los metodos `zero_grad()` y `step()`.
-
-### Parametros del constructor
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `model` | objeto callable | Modelo que recibe `x` y devuelve predicciones. |
-| `loss_fn` | funcion callable | Funcion de perdida. Recibe `(y_pred, y)` y devuelve un valor numerico. |
-| `optimizer` | objeto, funcion o `None` | Optimizador opcional. Puede tener `zero_grad()` y `step()`, o ser una funcion callable. |
-| `metric_fn` | funcion callable | Metrica usada para evaluar. Por defecto usa `accuracy_score`. |
-
-### Metodos principales
-
-#### `train_one_epoch(train_loader)`
-
-Parametro:
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `train_loader` | iterable | Iterable que entrega pares `(x, y)`. |
-
-Devuelve:
-
-```python
-{"loss": float, "metric": float}
-```
-
-Tambien actualiza `history["train_loss"]` y `history["train_metric"]`.
-
-#### `validate(val_loader)`
-
-Parametro:
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `val_loader` | iterable | Iterable que entrega pares `(x, y)`. |
-
-Devuelve:
-
-```python
-{"loss": float, "metric": float}
-```
-
-Tambien actualiza `history["val_loss"]` y `history["val_metric"]`.
-
-#### `fit(train_loader, val_loader=None, epochs=1, patience=None)`
-
-Parametros:
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `train_loader` | iterable | Datos de entrenamiento en pares `(x, y)`. |
-| `val_loader` | iterable o `None` | Datos de validacion. Si es `None`, solo entrena. |
-| `epochs` | `int` | Numero maximo de epocas. |
-| `patience` | `int` o `None` | Early stopping simple segun perdida de validacion. |
-
-Devuelve:
-
-```text
-history
-```
-
-Donde `history` guarda listas de perdidas y metricas de entrenamiento/validacion.
-
-#### `save_checkpoint(path)`
-
-Parametro:
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `path` | `str` | Ruta donde se guarda el checkpoint. |
-
-Devuelve: no devuelve valor. Guarda modelo e historial usando `pickle`.
-
-#### `load_checkpoint(path)`
-
-Parametro:
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `path` | `str` | Ruta del checkpoint a cargar. |
-
-Devuelve:
-
-```text
-checkpoint
-```
-
-Tambien reemplaza `self.model` y restaura `self.history` si existe.
-
-## Inicializacion de pesos
-
-Archivo: `python/utils/weight_init.py`
-
-### `truncated_normal(shape, mean=0.0, std=0.02, limit=2.0, seed=None)`
-
-Parametros:
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `shape` | `tuple` | Forma del arreglo a crear. |
-| `mean` | `float` | Media de la distribucion normal. |
-| `std` | `float` | Desviacion estandar. |
-| `limit` | `float` | Limite de recorte medido en desviaciones estandar. |
-| `seed` | `int` o `None` | Semilla opcional. |
-
-Devuelve:
-
-```text
-np.ndarray
-```
-
-Arreglo inicializado con normal truncada.
-
-### `xavier_uniform(shape, seed=None)`
-
-Parametros:
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `shape` | `tuple` | Forma del arreglo. Para matrices usa `(fan_in, fan_out)`. |
-| `seed` | `int` o `None` | Semilla opcional. |
-
-Devuelve:
-
-```text
-np.ndarray
-```
-
-Arreglo inicializado con Xavier uniforme. Si `shape` tiene menos de dos dimensiones, devuelve ceros.
-
-### `init_weights_vit(model, seed=None)`
-
-Parametros:
-
-| Parametro | Tipo esperado | Descripcion |
-| --- | --- | --- |
-| `model` | objeto | Objeto con atributos NumPy o subobjetos con atributos NumPy. |
-| `seed` | `int` o `None` | Semilla opcional. |
-
-Devuelve:
-
-```text
-model
-```
-
-Inicializa en sitio los arreglos NumPy del modelo: matrices con Xavier uniforme y vectores con ceros.
-
-## Pruebas
-
-Archivo: `python/tests/test_vit.py`
-
-Las pruebas verifican:
-
-- El MLP conserva la forma de entrada.
-- El bloque encoder conserva la forma y puede devolver pesos de atencion.
-- El bloque encoder acepta listas de Python.
-- Las metricas funcionan con logits/probabilidades.
-- El `Trainer` puede ejecutar una epoca con un modelo NumPy simple.
-- `init_weights_vit` modifica matrices y deja bias en cero.
-
-Para ejecutar:
+### **6. Compilar en Linux / WSL**
 
 ```bash
-python -m pytest python/tests/test_vit.py -v
+cd cuda
+mkdir build && cd build
+cmake .. -DCMAKE_CUDA_ARCHITECTURES=native
+cmake --build . --config Release
+./vit_train
 ```
+
+---
+
+## 🧪 Pruebas Unitarias en GPU
+
+Para ejecutar las pruebas unitarias CUDA de cada componente:
+
+```powershell
+.\build\test_attention.exe
+.\build\test_encoder.exe
+.\build\test_patch_embedding.exe
+```
+
+---
+
+## 📁 Estructura del Código CUDA
+
+- **`capa1_nucleo/`**:
+  - `tensor.cu`: Clase `Tensor` multidimensional.
+  - `cuda_utils.cuh`: Funciones de reducción rápida usando **Warp Shuffle** (`__shfl_down_sync`).
+- **`capa2_componentes/`**:
+  - `patch_embedding`: Divide la imagen 28x28 en parches de 7x7 y proyecta los tokens con embeddings de posición.
+  - `attention`: Multi-Head Self-Attention optimizado con el patrón **FlashAttention** (online softmax).
+  - `encoder`: LayerNorm y MLP (capas lineales + activación GELU).
+  - `softmax`: Softmax CUDA optimizado con reducción en memoria compartida.
+- **`capa3_modelo/`**:
+  - `vit.cu`: Modelo Vision Transformer completo (patch embedding → bloques encoder → extracción token CLS → clasificación).
+- **`capa4_entrenamiento/`**:
+  - `mnist_loader`: Lector de archivos binarios IDX de MNIST.
+  - `training`: Loss Cross-Entropy, actualización SGD y loop de entrenamiento/evaluación.
+  - `main.cu`: Punto de entrada principal.
+- **`tests/`**: Pruebas unitarias para verificar los componentes en la GPU.

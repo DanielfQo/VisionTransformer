@@ -26,9 +26,10 @@ void sgd_update_cuda(float* d_param, const float* d_grad,
                      float lr, std::size_t n,
                      cudaStream_t stream = nullptr);
 
-// entrena el ViT en un dataset MNIST
+// entrena el ViT en un dataset MNIST con set de validacion
 // retorna el accuracy final en test
 float train_vit(const float* h_train_images, const int* h_train_labels, int n_train,
+                const float* h_val_images, const int* h_val_labels, int n_val,
                 const float* h_test_images, const int* h_test_labels, int n_test,
                 VitWeights& weights, const VitConfig& config,
                 int epochs, int batch_size, float learning_rate);
