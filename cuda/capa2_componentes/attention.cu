@@ -147,11 +147,15 @@ __global__ void attention_kernel(
     const std::size_t row =
         (static_cast<std::size_t>(b) * heads + h) * tokens + q;
 
-    // Paso 1: maximo score con warp shuffle (__shfl_down_sync)
+    // memoria compartida dinamica para cachear los scores de atencion (Q.K)
+    extern __shared__ float s_scores[];
+
+    // Paso 1: calcular Q.K solo UNA vez y guardar en s_scores[k]
     float local_max = -CUDART_INF_F;
     for (int k = threadIdx.x; k < tokens; k += blockDim.x) {
         const std::size_t weight_index = row * tokens + k;
         if (mask != nullptr && mask[weight_index] == 0) {
+            s_scores[k] = -CUDART_INF_F;
             continue;
         }
 
@@ -164,8 +168,10 @@ __global__ void attention_kernel(
             dot += input[q_index] * input[k_index];
         }
         float score = dot * rsqrtf(static_cast<float>(dim));
+        s_scores[k] = score;
         local_max = fmaxf(local_max, score);
     }
+    __syncthreads();
 
     float max_val = block_reduce_max(local_max);
     __shared__ float s_max;
@@ -175,25 +181,14 @@ __global__ void attention_kernel(
     __syncthreads();
     max_val = s_max;
 
-    // Paso 2: denominador exp con warp shuffle (FlashAttention online reduction)
+    // Paso 2: denominador exp utilizando s_scores[k] de la memoria compartida
     float local_sum = 0.0F;
     if (max_val != -CUDART_INF_F) {
         for (int k = threadIdx.x; k < tokens; k += blockDim.x) {
-            const std::size_t weight_index = row * tokens + k;
-            if (mask != nullptr && mask[weight_index] == 0) {
-                continue;
+            float score = s_scores[k];
+            if (score != -CUDART_INF_F) {
+                local_sum += expf(score - max_val);
             }
-
-            float dot = 0.0F;
-            for (int d = 0; d < dim; ++d) {
-                const std::size_t q_index =
-                    (static_cast<std::size_t>(b) * tokens + q) * d_model + feature + d;
-                const std::size_t k_index =
-                    (static_cast<std::size_t>(b) * tokens + k) * d_model + feature + d;
-                dot += input[q_index] * input[k_index];
-            }
-            float score = dot * rsqrtf(static_cast<float>(dim));
-            local_sum += expf(score - max_val);
         }
     }
 
@@ -205,25 +200,15 @@ __global__ void attention_kernel(
     __syncthreads();
     denom = s_denom;
 
-    // Paso 3: acumulacion directa O = P * V sin guardar matriz NxN (FlashAttention)
+    // Paso 3: acumulacion O = P * V reutilizando s_scores[k] de memoria compartida
     for (int d = threadIdx.x; d < dim; d += blockDim.x) {
         float acc = 0.0F;
         if (denom > 0.0F && max_val != -CUDART_INF_F) {
             for (int k = 0; k < tokens; ++k) {
-                const std::size_t weight_index = row * tokens + k;
-                if (mask != nullptr && mask[weight_index] == 0) {
+                float score = s_scores[k];
+                if (score == -CUDART_INF_F) {
                     continue;
                 }
-
-                float dot = 0.0F;
-                for (int d_sub = 0; d_sub < dim; ++d_sub) {
-                    const std::size_t q_idx =
-                        (static_cast<std::size_t>(b) * tokens + q) * d_model + feature + d_sub;
-                    const std::size_t k_idx =
-                        (static_cast<std::size_t>(b) * tokens + k) * d_model + feature + d_sub;
-                    dot += input[q_idx] * input[k_idx];
-                }
-                float score = dot * rsqrtf(static_cast<float>(dim));
                 float w = expf(score - max_val) / denom;
 
                 if (weights != nullptr && d == 0) {
@@ -257,7 +242,8 @@ void multi_head_self_attention_cuda(
     }
 
     const dim3 grid(shape.tokens, shape.heads, shape.batch);
-    attention_kernel<<<grid, kBlockSize, 0, stream>>>(
+    std::size_t smem_bytes = static_cast<std::size_t>(shape.tokens) * sizeof(float);
+    attention_kernel<<<grid, kBlockSize, smem_bytes, stream>>>(
         d_input,
         d_output,
         d_mask,

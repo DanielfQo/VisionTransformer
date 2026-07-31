@@ -137,35 +137,51 @@ __global__ void layer_norm_kernel(const float* input, const float* gamma,
 }
 
 
-// un hilo por (fila, feature de salida)
+// multiplicacion matricial optimizada con tiling en memoria compartida (16x16)
+constexpr int kTileSize = 16;
+
 __global__ void linear_kernel(const float* input, const float* weight,
                               const float* bias, float* output,
-                              int in_features, int out_features) {
-    int o = blockIdx.x * blockDim.x + threadIdx.x;
-    int r = blockIdx.y;
-    if (o >= out_features) {
-        return;
+                              int in_features, int out_features, int rows) {
+    __shared__ float s_in[kTileSize][kTileSize];
+    __shared__ float s_w[kTileSize][kTileSize];
+
+    int col = blockIdx.x * kTileSize + threadIdx.x;
+    int row = blockIdx.y * kTileSize + threadIdx.y;
+
+    float acc = 0.0f;
+    int num_tiles = (in_features + kTileSize - 1) / kTileSize;
+
+    for (int t = 0; t < num_tiles; ++t) {
+        int in_col = t * kTileSize + threadIdx.x;
+        if (row < rows && in_col < in_features) {
+            s_in[threadIdx.y][threadIdx.x] = input[static_cast<std::size_t>(row) * in_features + in_col];
+        } else {
+            s_in[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        int in_row = t * kTileSize + threadIdx.y;
+        if (in_row < in_features && col < out_features) {
+            s_w[threadIdx.y][threadIdx.x] = weight[static_cast<std::size_t>(in_row) * out_features + col];
+        } else {
+            s_w[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        __syncthreads();
+
+        for (int k = 0; k < kTileSize; ++k) {
+            acc += s_in[threadIdx.y][k] * s_w[k][threadIdx.x];
+        }
+
+        __syncthreads();
     }
 
-    const float* x = input + static_cast<std::size_t>(r) * in_features;
-    float acc = bias != nullptr ? bias[o] : 0.0f;
-    for (int i = 0; i < in_features; ++i) {
-        acc += x[i] * weight[static_cast<std::size_t>(i) * out_features + o];
+    if (row < rows && col < out_features) {
+        if (bias != nullptr) {
+            acc += bias[col];
+        }
+        output[static_cast<std::size_t>(row) * out_features + col] = acc;
     }
-    output[static_cast<std::size_t>(r) * out_features + o] = acc;
-}
-
-
-__global__ void gelu_kernel(const float* input, float* output, std::size_t n) {
-    std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) {
-        return;
-    }
-
-    float x = input[i];
-    float k = 0.7978845608028654f;  // sqrt(2/pi)
-    float c = 0.044715f;
-    output[i] = 0.5f * x * (1.0f + tanhf(k * (x + c * x * x * x)));
 }
 
 }  // namespace
@@ -194,10 +210,12 @@ void linear_cuda(const float* d_input, const float* d_weight,
         throw std::invalid_argument("linear_cuda: punteros nulos");
     }
 
-    dim3 grid((shape.out_features + kBlockSize - 1) / kBlockSize, shape.rows);
-    linear_kernel<<<grid, kBlockSize, 0, stream>>>(
+    dim3 block(kTileSize, kTileSize);
+    dim3 grid((shape.out_features + kTileSize - 1) / kTileSize,
+              (shape.rows + kTileSize - 1) / kTileSize);
+    linear_kernel<<<grid, block, 0, stream>>>(
         d_input, d_weight, d_bias, d_output, shape.in_features,
-        shape.out_features);
+        shape.out_features, shape.rows);
     check_cuda(cudaGetLastError(), "No se pudo lanzar linear_kernel");
 }
 

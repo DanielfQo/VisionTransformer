@@ -69,9 +69,9 @@ int main() {
     }
 
     // ---- 4. Entrenar y evaluar ----
-    int epochs = 3;
+    int epochs = 100;
     int batch_size = 32;
-    float lr = 0.001f;
+    float lr = 0.0001f;
 
     std::printf("Entrenamiento:\n");
     std::printf("  Epochs:     %d\n", epochs);

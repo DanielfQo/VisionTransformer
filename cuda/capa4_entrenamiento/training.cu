@@ -42,6 +42,18 @@ __global__ void cross_entropy_kernel(const float* logits, const int* labels,
     loss_per_sample[b] = -log_softmax;
 }
 
+// kernel para reducir la suma del loss en la GPU
+__global__ void reduce_sum_kernel(const float* input, float* output, int n) {
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        local_sum += input[i];
+    }
+    float total = block_reduce_sum(local_sum);
+    if (threadIdx.x == 0) {
+        *output = total;
+    }
+}
+
 __global__ void sgd_kernel(float* param, const float* grad,
                            float lr, std::size_t n) {
     std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -90,19 +102,19 @@ float cross_entropy_loss(const float* d_logits, const int* d_labels,
         d_logits, d_labels, d_loss_workspace, batch, n_classes);
     check_cuda(cudaGetLastError(), "cross_entropy_kernel");
 
-    // copiar losses a CPU y promediar
-    std::vector<float> h_losses(batch);
-    check_cuda(cudaMemcpyAsync(h_losses.data(), d_loss_workspace,
-                                batch * sizeof(float),
-                                cudaMemcpyDeviceToHost, stream),
-               "copy losses to host");
-    check_cuda(cudaStreamSynchronize(stream), "sync losses");
+    // reduccion paralela del loss directamente en la GPU
+    float* d_total_sum = d_loss_workspace + batch;
+    reduce_sum_kernel<<<1, kBlockSize, 0, stream>>>(d_loss_workspace, d_total_sum, batch);
+    check_cuda(cudaGetLastError(), "reduce_sum_kernel");
 
-    float total = 0.0f;
-    for (int i = 0; i < batch; ++i) {
-        total += h_losses[i];
-    }
-    return total / static_cast<float>(batch);
+    float h_total_loss = 0.0f;
+    check_cuda(cudaMemcpyAsync(&h_total_loss, d_total_sum,
+                                sizeof(float),
+                                cudaMemcpyDeviceToHost, stream),
+               "copy total loss to host");
+    check_cuda(cudaStreamSynchronize(stream), "sync loss");
+
+    return h_total_loss / static_cast<float>(batch);
 }
 
 void cross_entropy_backward_cuda(const float* d_logits, const int* d_labels,
@@ -149,7 +161,7 @@ float train_vit(const float* h_train_images, const int* h_train_labels, int n_tr
                "alloc d_grad_logits");
     check_cuda(cudaMalloc(&d_labels, static_cast<std::size_t>(batch_size) * sizeof(int)),
                "alloc d_labels");
-    check_cuda(cudaMalloc(&d_loss_ws, static_cast<std::size_t>(batch_size) * sizeof(float)),
+    check_cuda(cudaMalloc(&d_loss_ws, (static_cast<std::size_t>(batch_size) + 1) * sizeof(float)),
                "alloc d_loss_ws");
     check_cuda(cudaMalloc(&d_workspace, workspace_bytes), "alloc workspace");
 
@@ -182,13 +194,13 @@ float train_vit(const float* h_train_images, const int* h_train_labels, int n_tr
                 h_batch_lbl[i] = h_train_labels[idx];
             }
 
-            // copiar a GPU
-            check_cuda(cudaMemcpy(d_images, h_batch_img.data(),
-                                  h_batch_img.size() * sizeof(float),
-                                  cudaMemcpyHostToDevice), "copy images H->D");
-            check_cuda(cudaMemcpy(d_labels, h_batch_lbl.data(),
-                                  h_batch_lbl.size() * sizeof(int),
-                                  cudaMemcpyHostToDevice), "copy labels H->D");
+            // copiar a GPU de forma asincrona
+            check_cuda(cudaMemcpyAsync(d_images, h_batch_img.data(),
+                                       h_batch_img.size() * sizeof(float),
+                                       cudaMemcpyHostToDevice, nullptr), "copy images H->D");
+            check_cuda(cudaMemcpyAsync(d_labels, h_batch_lbl.data(),
+                                       h_batch_lbl.size() * sizeof(int),
+                                       cudaMemcpyHostToDevice, nullptr), "copy labels H->D");
 
             // reiniciar gradientes
             vit_zero_gradients(grads, config, nullptr);
