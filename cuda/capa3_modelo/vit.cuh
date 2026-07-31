@@ -78,4 +78,27 @@ void vit_forward(const float* d_image, float* d_logits,
 // calcula los bytes necesarios para el workspace temporal
 std::size_t vit_workspace_bytes(const VitConfig& config, int batch);
 
+// ---- gradientes y backward pass ----
+
+using VitGradients = VitWeights;
+
+void vit_init_gradients(VitGradients& grads, const VitConfig& config);
+void vit_zero_gradients(VitGradients& grads, const VitConfig& config, cudaStream_t stream = nullptr);
+void vit_free_gradients(VitGradients& grads, const VitConfig& config);
+
+void vit_backward(const float* d_image,
+                  const float* d_grad_logits,
+                  float* d_workspace,
+                  const VitWeights& weights,
+                  VitGradients& grads,
+                  const VitConfig& config,
+                  int batch,
+                  cudaStream_t stream = nullptr);
+
+void vit_update_weights_sgd(VitWeights& weights,
+                            const VitGradients& grads,
+                            const VitConfig& config,
+                            float learning_rate,
+                            cudaStream_t stream = nullptr);
+
 }  // namespace vit

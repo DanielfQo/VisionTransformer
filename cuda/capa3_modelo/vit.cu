@@ -1,4 +1,5 @@
 #include "vit.cuh"
+#include "../capa4_entrenamiento/training.cuh"
 
 #include <cmath>
 #include <cstring>
@@ -182,22 +183,10 @@ std::size_t vit_workspace_bytes(const VitConfig& config, int batch) {
     const std::size_t nc = config.n_classes;
     const std::size_t B  = batch;
 
-    // buffers necesarios (pueden reutilizarse, necesitamos el maximo):
-    // buf_embed:    B * sl * d     (salida del patch embedding)
-    // buf_norm:     B * sl * d     (salida de layer norm)
-    // buf_attn:     B * sl * d     (salida de attention)
-    // buf_residual: B * sl * d     (residual temporal)
-    // buf_mlp_h:    B * sl * mh    (hidden del MLP)
-    // buf_mlp_out:  B * sl * d     (salida del MLP)
-    // buf_cls:      B * d          (CLS token extraido)
-    // buf_logits:   B * nc         (logits finales)
-    // Total: necesitamos 6 buffers de tamano B*sl*d + 1 de B*sl*mh + B*d + B*nc
-
     std::size_t token_buf = B * sl * d;
     std::size_t mlp_buf   = B * sl * mh;
 
-    // usamos 6 token buffers + 1 mlp hidden buffer
-    return (6 * token_buf + mlp_buf + B * d + B * nc) * sizeof(float);
+    return (16 * token_buf + 4 * mlp_buf + 4 * B * d + B * nc) * sizeof(float);
 }
 
 // ---- forward ----
@@ -225,7 +214,6 @@ void vit_forward(const float* d_image, float* d_logits,
     float* buf5 = buf4 + token_size;                          // extra temp
     float* buf_mlp_hidden = buf5 + token_size;                // mlp hidden
     float* buf_cls = buf_mlp_hidden + mlp_size;               // cls extract
-    // d_logits se usa directamente para la salida
 
     // ---- 1. Patch Embedding ----
     PatchEmbeddingShape pe_shape;
@@ -247,32 +235,26 @@ void vit_forward(const float* d_image, float* d_logits,
         stream);
 
     // ---- 2. Encoder blocks ----
-    // current = buf0
     float* current = buf0;
 
     for (int l = 0; l < config.n_layers; ++l) {
         const int rows = batch * sl;
 
         // --- sub-block 1: x + attention(norm1(x)) ---
-        // norm1
         LayerNormShape ln_shape{rows, d};
         layer_norm_cuda(current, weights.ln1_gamma[l], weights.ln1_beta[l],
                         buf1, ln_shape, 1e-5f, stream);
 
-        // attention
         AttentionShape attn_shape{batch, sl, d, config.heads};
         multi_head_self_attention_cuda(buf1, buf2, attn_shape,
                                        nullptr, nullptr, stream);
 
-        // residual: buf3 = current + buf2
         add_cuda(current, buf2, buf3, token_size, stream);
 
         // --- sub-block 2: residual + mlp(norm2(residual)) ---
-        // norm2
         layer_norm_cuda(buf3, weights.ln2_gamma[l], weights.ln2_beta[l],
                         buf1, ln_shape, 1e-5f, stream);
 
-        // mlp: linear1 -> gelu -> linear2
         LinearShape lin1_shape{rows, d, mh};
         linear_cuda(buf1, weights.mlp_w1[l], weights.mlp_b1[l],
                     buf_mlp_hidden, lin1_shape, stream);
@@ -282,8 +264,6 @@ void vit_forward(const float* d_image, float* d_logits,
         linear_cuda(buf_mlp_hidden, weights.mlp_w2[l], weights.mlp_b2[l],
                     buf4, lin2_shape, stream);
 
-        // residual: current = buf3 + buf4
-        // Si no es la ultima capa, result va a buf0 (current); si es la ultima a buf5
         float* next = (l < config.n_layers - 1) ? buf0 : buf5;
         add_cuda(buf3, buf4, next, token_size, stream);
         current = next;
@@ -297,9 +277,7 @@ void vit_forward(const float* d_image, float* d_logits,
                         buf1, ln_shape, 1e-5f, stream);
     }
 
-    // ---- 4. Extract CLS token (token 0 de cada batch) ----
-    // buf1 contiene [batch, seq_len, d_model], extraemos token 0
-    // Usamos cudaMemcpy2D: copiar d floats con stride sl*d
+    // ---- 4. Extract CLS token ----
     for (int b = 0; b < batch; ++b) {
         check_cuda(cudaMemcpyAsync(
             buf_cls + static_cast<std::size_t>(b) * d,
@@ -309,12 +287,227 @@ void vit_forward(const float* d_image, float* d_logits,
             stream), "extract CLS token");
     }
 
-    // ---- 5. Classification head: linear(cls) -> logits ----
+    // ---- 5. Classification head ----
     {
         LinearShape head_shape{batch, d, nc};
         linear_cuda(buf_cls, weights.head_weight, weights.head_bias,
                     d_logits, head_shape, stream);
     }
+}
+
+// ---- gradientes y backward pass ----
+
+void vit_init_gradients(VitGradients& grads, const VitConfig& config) {
+    const int d = config.d_model;
+    const int pd = config.patch_dim();
+    const int sl = config.seq_len();
+    const int mh = config.mlp_hidden;
+    const int nc = config.n_classes;
+    const int nl = config.n_layers;
+
+    grads.pe_weight = alloc_gpu(static_cast<std::size_t>(pd) * d);
+    grads.pe_bias = alloc_gpu(d);
+    grads.cls_token = alloc_gpu(d);
+    grads.position_embedding = alloc_gpu(static_cast<std::size_t>(sl) * d);
+
+    grads.ln1_gamma = new float*[nl];
+    grads.ln1_beta  = new float*[nl];
+    grads.ln2_gamma = new float*[nl];
+    grads.ln2_beta  = new float*[nl];
+    grads.mlp_w1    = new float*[nl];
+    grads.mlp_b1    = new float*[nl];
+    grads.mlp_w2    = new float*[nl];
+    grads.mlp_b2    = new float*[nl];
+
+    for (int l = 0; l < nl; ++l) {
+        grads.ln1_gamma[l] = alloc_gpu(d);
+        grads.ln1_beta[l]  = alloc_gpu(d);
+        grads.ln2_gamma[l] = alloc_gpu(d);
+        grads.ln2_beta[l]  = alloc_gpu(d);
+
+        grads.mlp_w1[l] = alloc_gpu(static_cast<std::size_t>(d) * mh);
+        grads.mlp_b1[l] = alloc_gpu(mh);
+        grads.mlp_w2[l] = alloc_gpu(static_cast<std::size_t>(mh) * d);
+        grads.mlp_b2[l] = alloc_gpu(d);
+    }
+
+    grads.final_ln_gamma = alloc_gpu(d);
+    grads.final_ln_beta  = alloc_gpu(d);
+    grads.head_weight    = alloc_gpu(static_cast<std::size_t>(d) * nc);
+    grads.head_bias      = alloc_gpu(nc);
+}
+
+void vit_zero_gradients(VitGradients& grads, const VitConfig& config, cudaStream_t stream) {
+    const int d = config.d_model;
+    const int pd = config.patch_dim();
+    const int sl = config.seq_len();
+    const int mh = config.mlp_hidden;
+    const int nc = config.n_classes;
+    const int nl = config.n_layers;
+
+    check_cuda(cudaMemsetAsync(grads.pe_weight, 0, static_cast<std::size_t>(pd) * d * sizeof(float), stream), "memset pe_weight");
+    check_cuda(cudaMemsetAsync(grads.pe_bias, 0, d * sizeof(float), stream), "memset pe_bias");
+    check_cuda(cudaMemsetAsync(grads.cls_token, 0, d * sizeof(float), stream), "memset cls_token");
+    check_cuda(cudaMemsetAsync(grads.position_embedding, 0, static_cast<std::size_t>(sl) * d * sizeof(float), stream), "memset pos_embed");
+
+    for (int l = 0; l < nl; ++l) {
+        check_cuda(cudaMemsetAsync(grads.ln1_gamma[l], 0, d * sizeof(float), stream), "memset ln1_g");
+        check_cuda(cudaMemsetAsync(grads.ln1_beta[l], 0, d * sizeof(float), stream), "memset ln1_b");
+        check_cuda(cudaMemsetAsync(grads.ln2_gamma[l], 0, d * sizeof(float), stream), "memset ln2_g");
+        check_cuda(cudaMemsetAsync(grads.ln2_beta[l], 0, d * sizeof(float), stream), "memset ln2_b");
+        check_cuda(cudaMemsetAsync(grads.mlp_w1[l], 0, static_cast<std::size_t>(d) * mh * sizeof(float), stream), "memset mlp_w1");
+        check_cuda(cudaMemsetAsync(grads.mlp_b1[l], 0, mh * sizeof(float), stream), "memset mlp_b1");
+        check_cuda(cudaMemsetAsync(grads.mlp_w2[l], 0, static_cast<std::size_t>(mh) * d * sizeof(float), stream), "memset mlp_w2");
+        check_cuda(cudaMemsetAsync(grads.mlp_b2[l], 0, d * sizeof(float), stream), "memset mlp_b2");
+    }
+
+    check_cuda(cudaMemsetAsync(grads.final_ln_gamma, 0, d * sizeof(float), stream), "memset final_g");
+    check_cuda(cudaMemsetAsync(grads.final_ln_beta, 0, d * sizeof(float), stream), "memset final_b");
+    check_cuda(cudaMemsetAsync(grads.head_weight, 0, static_cast<std::size_t>(d) * nc * sizeof(float), stream), "memset head_w");
+    check_cuda(cudaMemsetAsync(grads.head_bias, 0, nc * sizeof(float), stream), "memset head_b");
+}
+
+void vit_free_gradients(VitGradients& grads, const VitConfig& config) {
+    vit_free_weights(grads, config);
+}
+
+void vit_update_weights_sgd(VitWeights& weights,
+                            const VitGradients& grads,
+                            const VitConfig& config,
+                            float learning_rate,
+                            cudaStream_t stream) {
+    const int d = config.d_model;
+    const int pd = config.patch_dim();
+    const int sl = config.seq_len();
+    const int mh = config.mlp_hidden;
+    const int nc = config.n_classes;
+    const int nl = config.n_layers;
+
+    sgd_update_cuda(weights.pe_weight, grads.pe_weight, learning_rate, static_cast<std::size_t>(pd) * d, stream);
+    sgd_update_cuda(weights.pe_bias, grads.pe_bias, learning_rate, d, stream);
+    sgd_update_cuda(weights.cls_token, grads.cls_token, learning_rate, d, stream);
+    sgd_update_cuda(weights.position_embedding, grads.position_embedding, learning_rate, static_cast<std::size_t>(sl) * d, stream);
+
+    for (int l = 0; l < nl; ++l) {
+        sgd_update_cuda(weights.ln1_gamma[l], grads.ln1_gamma[l], learning_rate, d, stream);
+        sgd_update_cuda(weights.ln1_beta[l], grads.ln1_beta[l], learning_rate, d, stream);
+        sgd_update_cuda(weights.ln2_gamma[l], grads.ln2_gamma[l], learning_rate, d, stream);
+        sgd_update_cuda(weights.ln2_beta[l], grads.ln2_beta[l], learning_rate, d, stream);
+        sgd_update_cuda(weights.mlp_w1[l], grads.mlp_w1[l], learning_rate, static_cast<std::size_t>(d) * mh, stream);
+        sgd_update_cuda(weights.mlp_b1[l], grads.mlp_b1[l], learning_rate, mh, stream);
+        sgd_update_cuda(weights.mlp_w2[l], grads.mlp_w2[l], learning_rate, static_cast<std::size_t>(mh) * d, stream);
+        sgd_update_cuda(weights.mlp_b2[l], grads.mlp_b2[l], learning_rate, d, stream);
+    }
+
+    sgd_update_cuda(weights.final_ln_gamma, grads.final_ln_gamma, learning_rate, d, stream);
+    sgd_update_cuda(weights.final_ln_beta, grads.final_ln_beta, learning_rate, d, stream);
+    sgd_update_cuda(weights.head_weight, grads.head_weight, learning_rate, static_cast<std::size_t>(d) * nc, stream);
+    sgd_update_cuda(weights.head_bias, grads.head_bias, learning_rate, nc, stream);
+}
+
+namespace {
+
+__global__ void scatter_cls_grad_kernel(const float* grad_cls, float* grad_seq,
+                                        int batch, int seq_len, int d_model) {
+    int b = blockIdx.x;
+    int d = threadIdx.x;
+    if (b < batch && d < d_model) {
+        std::size_t seq_idx = (static_cast<std::size_t>(b) * seq_len + 0) * d_model + d;
+        grad_seq[seq_idx] = grad_cls[static_cast<std::size_t>(b) * d_model + d];
+    }
+}
+
+}  // namespace
+
+void vit_backward(const float* d_image,
+                  const float* d_grad_logits,
+                  float* d_workspace,
+                  const VitWeights& weights,
+                  VitGradients& grads,
+                  const VitConfig& config,
+                  int batch,
+                  cudaStream_t stream) {
+    const int sl = config.seq_len();
+    const int d  = config.d_model;
+    const int mh = config.mlp_hidden;
+    const int nc = config.n_classes;
+
+    const std::size_t token_size = static_cast<std::size_t>(batch) * sl * d;
+    const std::size_t mlp_size   = static_cast<std::size_t>(batch) * sl * mh;
+
+    float* buf0 = d_workspace;                               // embed output / current
+    float* buf1 = buf0 + token_size;                          // norm output
+    float* buf2 = buf1 + token_size;                          // attn output
+    float* buf3 = buf2 + token_size;                          // residual
+    float* buf4 = buf3 + token_size;                          // mlp output
+    float* buf5 = buf4 + token_size;                          // extra temp
+    float* buf_mlp_hidden = buf5 + token_size;                // mlp hidden
+    float* buf_cls = buf_mlp_hidden + mlp_size;               // cls extract
+
+    float* d_grad_cls = buf_cls + batch * d;                  // [batch, d]
+    float* d_grad_seq = d_grad_cls + batch * d;               // [batch, sl, d]
+    float* d_grad_tmp = d_grad_seq + token_size;              // [batch, sl, d]
+    float* d_grad_mlp = d_grad_tmp + token_size;              // [batch, sl, mh]
+
+    // 1. Classification head backward: cls -> logits
+    LinearShape head_shape{batch, d, nc};
+    linear_backward_cuda(buf_cls, weights.head_weight, d_grad_logits,
+                         d_grad_cls, grads.head_weight, grads.head_bias,
+                         head_shape, stream);
+
+    // 2. Scatter d_grad_cls a d_grad_seq
+    check_cuda(cudaMemsetAsync(d_grad_seq, 0, token_size * sizeof(float), stream), "zero d_grad_seq");
+    scatter_cls_grad_kernel<<<batch, d, 0, stream>>>(d_grad_cls, d_grad_seq, batch, sl, d);
+    check_cuda(cudaGetLastError(), "scatter_cls_grad_kernel");
+
+    // 3. Final LayerNorm backward
+    const int rows = batch * sl;
+    LayerNormShape ln_shape{rows, d};
+    float* current = (config.n_layers > 0) ? buf5 : buf0;
+    layer_norm_backward_cuda(current, weights.final_ln_gamma, d_grad_seq, d_grad_tmp,
+                            grads.final_ln_gamma, grads.final_ln_beta, ln_shape, 1e-5f, stream);
+
+    // 4. Encoder layers backward (capas en orden inverso: nl-1 -> 0)
+    for (int l = config.n_layers - 1; l >= 0; --l) {
+        LinearShape lin2_shape{rows, mh, d};
+        linear_backward_cuda(buf_mlp_hidden, weights.mlp_w2[l], d_grad_tmp,
+                             d_grad_mlp, grads.mlp_w2[l], grads.mlp_b2[l], lin2_shape, stream);
+
+        gelu_backward_cuda(buf_mlp_hidden, d_grad_mlp, d_grad_mlp, mlp_size, stream);
+
+        LinearShape lin1_shape{rows, d, mh};
+        linear_backward_cuda(buf1, weights.mlp_w1[l], d_grad_mlp,
+                             d_grad_seq, grads.mlp_w1[l], grads.mlp_b1[l], lin1_shape, stream);
+
+        layer_norm_backward_cuda(buf3, weights.ln2_gamma[l], d_grad_seq, d_grad_tmp,
+                                grads.ln2_gamma[l], grads.ln2_beta[l], ln_shape, 1e-5f, stream);
+
+        LinearShape attn_lin_shape{rows, d, d};
+        linear_backward_cuda(buf1, weights.ln1_gamma[l], d_grad_tmp, d_grad_seq,
+                             nullptr, nullptr, attn_lin_shape, stream);
+
+        layer_norm_backward_cuda(current, weights.ln1_gamma[l], d_grad_seq, d_grad_tmp,
+                                grads.ln1_gamma[l], grads.ln1_beta[l], ln_shape, 1e-5f, stream);
+    }
+
+    // 5. Patch Embedding backward
+    PatchEmbeddingShape pe_shape;
+    pe_shape.batch       = batch;
+    pe_shape.in_channels = config.in_channels;
+    pe_shape.height      = config.image_size;
+    pe_shape.width       = config.image_size;
+    pe_shape.patch_size  = config.patch_size;
+    pe_shape.d_model     = d;
+
+    patch_embedding_pipeline_backward_cuda(
+        d_image,
+        d_grad_tmp,
+        grads.pe_weight,
+        grads.pe_bias,
+        grads.cls_token,
+        grads.position_embedding,
+        pe_shape,
+        stream);
 }
 
 }  // namespace vit
