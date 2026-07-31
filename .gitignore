@@ -1,0 +1,58 @@
+# Build directories (C++ / CUDA / CMake)
+build/
+*/build/
+bin/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.dir/
+*_autogen/
+compile_commands.json
+
+# C++ / CUDA compiled binaries & object files
+*.exe
+*.obj
+*.o
+*.lib
+*.a
+*.dll
+*.so
+*.dylib
+*.exp
+*.pdb
+*.ilk
+
+# Python byte-compiled / environment / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.eggs/
+
+# Downloaded / generated datasets & caches in tests
+python/tests/MNIST/
+python/tests/data/
+*.pt
+*.pth
+*.onnx
+
+# IDE / OS specific files
+.vscode/
+.idea/
+.vs/
+*.user
+*.suo
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
