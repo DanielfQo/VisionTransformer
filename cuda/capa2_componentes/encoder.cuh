@@ -57,4 +57,22 @@ void linear_cuda(const float* d_input, const float* d_weight,
 void gelu_cuda(const float* d_input, float* d_output, std::size_t n,
                cudaStream_t stream = nullptr);
 
+// ---- CUDA backward versions ----
+
+void layer_norm_backward_cuda(const float* d_input, const float* d_gamma,
+                              const float* d_grad_out, float* d_grad_in,
+                              float* d_grad_gamma, float* d_grad_beta,
+                              const LayerNormShape& shape, float eps,
+                              cudaStream_t stream = nullptr);
+
+void linear_backward_cuda(const float* d_input, const float* d_weight,
+                          const float* d_grad_out, float* d_grad_in,
+                          float* d_grad_weight, float* d_grad_bias,
+                          const LinearShape& shape,
+                          cudaStream_t stream = nullptr);
+
+void gelu_backward_cuda(const float* d_input, const float* d_grad_out,
+                        float* d_grad_in, std::size_t n,
+                        cudaStream_t stream = nullptr);
+
 }  // namespace vit

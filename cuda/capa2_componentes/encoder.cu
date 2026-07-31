@@ -213,4 +213,191 @@ void gelu_cuda(const float* d_input, float* d_output, std::size_t n,
     check_cuda(cudaGetLastError(), "No se pudo lanzar gelu_kernel");
 }
 
+// ---- CUDA backward kernels ----
+
+namespace {
+
+__global__ void layer_norm_backward_kernel(const float* input, const float* gamma,
+                                           const float* grad_out, float* grad_in,
+                                           float* grad_gamma, float* grad_beta,
+                                           int dim, float eps) {
+    int row = blockIdx.x;
+    const float* x = input + static_cast<std::size_t>(row) * dim;
+    const float* dy = grad_out + static_cast<std::size_t>(row) * dim;
+    float* dx = grad_in != nullptr ? grad_in + static_cast<std::size_t>(row) * dim : nullptr;
+
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        local_sum += x[i];
+    }
+    float total_sum = block_reduce_sum(local_sum);
+    __shared__ float s_mean;
+    if (threadIdx.x == 0) {
+        s_mean = total_sum / static_cast<float>(dim);
+    }
+    __syncthreads();
+    float mean = s_mean;
+
+    float local_var = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float d = x[i] - mean;
+        local_var += d * d;
+    }
+    float total_var = block_reduce_sum(local_var);
+    __shared__ float s_inv;
+    if (threadIdx.x == 0) {
+        s_inv = rsqrtf(total_var / static_cast<float>(dim) + eps);
+    }
+    __syncthreads();
+    float inv = s_inv;
+
+    float local_dhat = 0.0f;
+    float local_dhat_xhat = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float g = gamma != nullptr ? gamma[i] : 1.0f;
+        float xhat = (x[i] - mean) * inv;
+        float dhat = dy[i] * g;
+        local_dhat += dhat;
+        local_dhat_xhat += dhat * xhat;
+
+        if (grad_gamma != nullptr) {
+            atomicAdd(&grad_gamma[i], dy[i] * xhat);
+        }
+        if (grad_beta != nullptr) {
+            atomicAdd(&grad_beta[i], dy[i]);
+        }
+    }
+
+    float total_dhat = block_reduce_sum(local_dhat);
+    float total_dhat_xhat = block_reduce_sum(local_dhat_xhat);
+    __shared__ float s_dhat, s_dhat_xhat;
+    if (threadIdx.x == 0) {
+        s_dhat = total_dhat;
+        s_dhat_xhat = total_dhat_xhat;
+    }
+    __syncthreads();
+
+    if (dx != nullptr) {
+        float inv_N = 1.0f / static_cast<float>(dim);
+        float s1 = s_dhat;
+        float s2 = s_dhat_xhat;
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+            float xhat = (x[i] - mean) * inv;
+            float g = gamma != nullptr ? gamma[i] : 1.0f;
+            float dhat = dy[i] * g;
+            dx[i] = inv * (dhat - inv_N * (s1 + xhat * s2));
+        }
+    }
+}
+
+__global__ void linear_backward_input_kernel(const float* weight, const float* grad_out,
+                                             float* grad_in, int in_features, int out_features) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int r = blockIdx.y;
+    if (i >= in_features) return;
+
+    const float* dy = grad_out + static_cast<std::size_t>(r) * out_features;
+    float acc = 0.0f;
+    for (int o = 0; o < out_features; ++o) {
+        acc += dy[o] * weight[static_cast<std::size_t>(i) * out_features + o];
+    }
+    grad_in[static_cast<std::size_t>(r) * in_features + i] = acc;
+}
+
+__global__ void linear_backward_params_kernel(const float* input, const float* grad_out,
+                                              float* grad_weight, float* grad_bias,
+                                              int rows, int in_features, int out_features) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y;
+    if (o >= out_features || i >= in_features) return;
+
+    float acc_w = 0.0f;
+    for (int r = 0; r < rows; ++r) {
+        float x = input[static_cast<std::size_t>(r) * in_features + i];
+        float dy = grad_out[static_cast<std::size_t>(r) * out_features + o];
+        acc_w += x * dy;
+    }
+    if (grad_weight != nullptr) {
+        atomicAdd(&grad_weight[static_cast<std::size_t>(i) * out_features + o], acc_w);
+    }
+
+    if (i == 0 && grad_bias != nullptr) {
+        float acc_b = 0.0f;
+        for (int r = 0; r < rows; ++r) {
+            acc_b += grad_out[static_cast<std::size_t>(r) * out_features + o];
+        }
+        atomicAdd(&grad_bias[o], acc_b);
+    }
+}
+
+__global__ void gelu_backward_kernel(const float* input, const float* grad_out,
+                                    float* grad_in, std::size_t n) {
+    std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float x = input[i];
+    float dy = grad_out[i];
+    float k = 0.7978845608028654f;  // sqrt(2/pi)
+    float c = 0.044715f;
+    float u = k * (x + c * x * x * x);
+    float t = tanhf(u);
+    float du_dx = k * (1.0f + 3.0f * c * x * x);
+    float dx = 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * du_dx;
+    grad_in[i] = dy * dx;
+}
+
+}  // namespace
+
+void layer_norm_backward_cuda(const float* d_input, const float* d_gamma,
+                              const float* d_grad_out, float* d_grad_in,
+                              float* d_grad_gamma, float* d_grad_beta,
+                              const LayerNormShape& shape, float eps,
+                              cudaStream_t stream) {
+    shape.validate();
+    if (d_input == nullptr || d_grad_out == nullptr) {
+        throw std::invalid_argument("layer_norm_backward_cuda: punteros nulos");
+    }
+
+    layer_norm_backward_kernel<<<shape.rows, kBlockSize, 0, stream>>>(
+        d_input, d_gamma, d_grad_out, d_grad_in, d_grad_gamma, d_grad_beta, shape.dim, eps);
+    check_cuda(cudaGetLastError(), "No se pudo lanzar layer_norm_backward_kernel");
+}
+
+void linear_backward_cuda(const float* d_input, const float* d_weight,
+                          const float* d_grad_out, float* d_grad_in,
+                          float* d_grad_weight, float* d_grad_bias,
+                          const LinearShape& shape,
+                          cudaStream_t stream) {
+    shape.validate();
+    if (d_input == nullptr || d_weight == nullptr || d_grad_out == nullptr) {
+        throw std::invalid_argument("linear_backward_cuda: punteros nulos");
+    }
+
+    if (d_grad_in != nullptr) {
+        dim3 grid_in((shape.in_features + kBlockSize - 1) / kBlockSize, shape.rows);
+        linear_backward_input_kernel<<<grid_in, kBlockSize, 0, stream>>>(
+            d_weight, d_grad_out, d_grad_in, shape.in_features, shape.out_features);
+        check_cuda(cudaGetLastError(), "No se pudo lanzar linear_backward_input_kernel");
+    }
+
+    if (d_grad_weight != nullptr || d_grad_bias != nullptr) {
+        dim3 grid_p((shape.out_features + kBlockSize - 1) / kBlockSize, shape.in_features);
+        linear_backward_params_kernel<<<grid_p, kBlockSize, 0, stream>>>(
+            d_input, d_grad_out, d_grad_weight, d_grad_bias, shape.rows, shape.in_features, shape.out_features);
+        check_cuda(cudaGetLastError(), "No se pudo lanzar linear_backward_params_kernel");
+    }
+}
+
+void gelu_backward_cuda(const float* d_input, const float* d_grad_out,
+                        float* d_grad_in, std::size_t n,
+                        cudaStream_t stream) {
+    if (d_input == nullptr || d_grad_out == nullptr || d_grad_in == nullptr) {
+        throw std::invalid_argument("gelu_backward_cuda: punteros nulos");
+    }
+
+    std::size_t blocks = (n + kBlockSize - 1) / kBlockSize;
+    gelu_backward_kernel<<<blocks, kBlockSize, 0, stream>>>(d_input, d_grad_out, d_grad_in, n);
+    check_cuda(cudaGetLastError(), "No se pudo lanzar gelu_backward_kernel");
+}
+
 }  // namespace vit
