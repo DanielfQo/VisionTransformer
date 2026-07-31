@@ -299,6 +299,7 @@ __global__ void layer_norm_backward_kernel(const float* input, const float* gamm
     }
 
     float total_dhat = block_reduce_sum(local_dhat);
+    __syncthreads();
     float total_dhat_xhat = block_reduce_sum(local_dhat_xhat);
     __shared__ float s_dhat, s_dhat_xhat;
     if (threadIdx.x == 0) {

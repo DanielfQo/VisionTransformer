@@ -243,7 +243,7 @@ void vit_forward(const float* d_image, float* d_logits,
         // --- sub-block 1: x + attention(norm1(x)) ---
         LayerNormShape ln_shape{rows, d};
         layer_norm_cuda(current, weights.ln1_gamma[l], weights.ln1_beta[l],
-                        buf1, ln_shape, 1e-5f, stream);
+                        buf1, ln_shape, config.eps, stream);
 
         AttentionShape attn_shape{batch, sl, d, config.heads};
         multi_head_self_attention_cuda(buf1, buf2, attn_shape,
@@ -253,7 +253,7 @@ void vit_forward(const float* d_image, float* d_logits,
 
         // --- sub-block 2: residual + mlp(norm2(residual)) ---
         layer_norm_cuda(buf3, weights.ln2_gamma[l], weights.ln2_beta[l],
-                        buf1, ln_shape, 1e-5f, stream);
+                        buf1, ln_shape, config.eps, stream);
 
         LinearShape lin1_shape{rows, d, mh};
         linear_cuda(buf1, weights.mlp_w1[l], weights.mlp_b1[l],
@@ -274,18 +274,15 @@ void vit_forward(const float* d_image, float* d_logits,
         const int rows = batch * sl;
         LayerNormShape ln_shape{rows, d};
         layer_norm_cuda(current, weights.final_ln_gamma, weights.final_ln_beta,
-                        buf1, ln_shape, 1e-5f, stream);
+                        buf1, ln_shape, config.eps, stream);
     }
 
-    // ---- 4. Extract CLS token ----
-    for (int b = 0; b < batch; ++b) {
-        check_cuda(cudaMemcpyAsync(
-            buf_cls + static_cast<std::size_t>(b) * d,
-            buf1 + static_cast<std::size_t>(b) * sl * d,
-            d * sizeof(float),
-            cudaMemcpyDeviceToDevice,
-            stream), "extract CLS token");
-    }
+    // ---- 4. Extract CLS token (token 0 de cada muestra, copia strided en una sola llamada) ----
+    check_cuda(cudaMemcpy2DAsync(
+        buf_cls, static_cast<std::size_t>(d) * sizeof(float),      // destino: filas contiguas de d
+        buf1, static_cast<std::size_t>(sl) * d * sizeof(float),    // origen: salto sl*d entre muestras
+        static_cast<std::size_t>(d) * sizeof(float), batch,        // ancho = d floats, alto = batch
+        cudaMemcpyDeviceToDevice, stream), "extract CLS token");
 
     // ---- 5. Classification head ----
     {
@@ -465,7 +462,7 @@ void vit_backward(const float* d_image,
     LayerNormShape ln_shape{rows, d};
     float* current = (config.n_layers > 0) ? buf5 : buf0;
     layer_norm_backward_cuda(current, weights.final_ln_gamma, d_grad_seq, d_grad_tmp,
-                            grads.final_ln_gamma, grads.final_ln_beta, ln_shape, 1e-5f, stream);
+                            grads.final_ln_gamma, grads.final_ln_beta, ln_shape, config.eps, stream);
 
     // 4. Encoder layers backward (capas en orden inverso: nl-1 -> 0)
     for (int l = config.n_layers - 1; l >= 0; --l) {
@@ -480,14 +477,14 @@ void vit_backward(const float* d_image,
                              d_grad_seq, grads.mlp_w1[l], grads.mlp_b1[l], lin1_shape, stream);
 
         layer_norm_backward_cuda(buf3, weights.ln2_gamma[l], d_grad_seq, d_grad_tmp,
-                                grads.ln2_gamma[l], grads.ln2_beta[l], ln_shape, 1e-5f, stream);
+                                grads.ln2_gamma[l], grads.ln2_beta[l], ln_shape, config.eps, stream);
 
         LinearShape attn_lin_shape{rows, d, d};
         linear_backward_cuda(buf1, weights.ln1_gamma[l], d_grad_tmp, d_grad_seq,
                              nullptr, nullptr, attn_lin_shape, stream);
 
         layer_norm_backward_cuda(current, weights.ln1_gamma[l], d_grad_seq, d_grad_tmp,
-                                grads.ln1_gamma[l], grads.ln1_beta[l], ln_shape, 1e-5f, stream);
+                                grads.ln1_gamma[l], grads.ln1_beta[l], ln_shape, config.eps, stream);
     }
 
     // 5. Patch Embedding backward

@@ -26,12 +26,18 @@ inline void require_device_pointer(const float* pointer, const char* name) {
 
 constexpr int kBlockSize = 256;
 
+// block_reduce_* asume blockDim.x multiplo de 32 (warps completos) y <= 1024.
+static_assert(kBlockSize % 32 == 0 && kBlockSize <= 1024,
+              "kBlockSize debe ser multiplo de 32 y <= 1024 (requisito de block_reduce_*)");
+
 inline dim3 grid_1d(std::size_t elements, int batch = 1) {
     auto blocks = static_cast<unsigned int>((elements + kBlockSize - 1) / kBlockSize);
     return dim3(blocks, 1, static_cast<unsigned int>(batch));
 }
 
 // ---- Parte 2: Reducciones optimizadas con Warp Shuffle (__shfl_down_sync) ----
+// requisito: todos los hilos del bloque llaman a block_reduce_* (sin divergencia)
+// y blockDim.x es multiplo de 32.
 
 __device__ __forceinline__ float warp_reduce_max(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -63,6 +69,7 @@ __device__ __forceinline__ float block_reduce_max(float val) {
     if (warp_id == 0) {
         val = warp_reduce_max(val);
     }
+    __syncthreads();  // permite llamadas consecutivas sin carrera sobre shared[]
     return val;
 }
 
@@ -82,6 +89,7 @@ __device__ __forceinline__ float block_reduce_sum(float val) {
     if (warp_id == 0) {
         val = warp_reduce_sum(val);
     }
+    __syncthreads();  // permite llamadas consecutivas sin carrera sobre shared[]
     return val;
 }
 

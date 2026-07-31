@@ -21,6 +21,7 @@ struct VitConfig {
     int n_layers     = 2;
     int mlp_hidden   = 256;
     int n_classes    = 10;
+    float eps        = 1e-5f;  // epsilon de LayerNorm
 
     int n_patches() const { return (image_size / patch_size) * (image_size / patch_size); }
     int seq_len()   const { return n_patches() + 1; }
