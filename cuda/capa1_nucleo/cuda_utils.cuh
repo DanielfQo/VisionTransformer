@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime_api.h>
+#include <math_constants.h>
 
 #include <cstddef>
 #include <stdexcept>
